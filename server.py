@@ -11,6 +11,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Optional
+from fastapi.responses import Response
+from dossier import generate_dossier_pdf, generate_dossier_filename
+
 
 COOKIE_SERVER_URL = os.getenv("COOKIE_SERVER_URL", "http://37.27.8.255:5001")
 
@@ -74,6 +77,39 @@ class SearchComparablesRequest(BaseModel):
     address: Optional[str] = None
     postal_code: Optional[str] = None
     building: Optional[dict] = None
+
+class ComparableInput(BaseModel):
+    id: str = ""
+    title: str = ""
+    address: str = ""
+    price: float = 0
+    priceByArea: float = 0
+    size: float = 0
+    rooms: int = 0
+    bathrooms: int = 0
+    distance: Optional[float] = None
+    source: str = "idealista"
+    url: str = ""
+    thumbnail: str = ""
+    selected: bool = False
+    in_range: bool = False
+
+class PropertyInput(BaseModel):
+    address: str = ""
+    total_area: float = 0
+    rooms: int = 0
+    bathrooms: int = 0
+
+class ValuationInput(BaseModel):
+    mean: float = 0
+    min: float = 0
+    max: float = 0
+
+class GenerateDossierRequest(BaseModel):
+    property: PropertyInput
+    coordinates: dict
+    valuation: ValuationInput
+    comparables: List[ComparableInput]
 
 class IdealistaService:
     def __init__(self):
@@ -638,6 +674,25 @@ async def search_comparables(request: SearchComparablesRequest):
         "total_found": len(all_comparables),
         "search_radius": SEARCH_RADII[len(search_summary) - 1] if search_summary else 0,
     }
+
+@app.post("/api/generate-dossier")
+async def generate_dossier(request: GenerateDossierRequest):
+    try:
+        data = {
+            "property": request.property.model_dump(),
+            "coordinates": request.coordinates,
+            "valuation": request.valuation.model_dump(),
+            "comparables": [c.model_dump() for c in request.comparables],
+        }
+        pdf_bytes = await generate_dossier_pdf(data)
+        filename = generate_dossier_filename(request.property.address)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
