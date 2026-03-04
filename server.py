@@ -109,7 +109,7 @@ class GenerateDossierRequest(BaseModel):
     property: PropertyInput
     coordinates: dict
     valuation: ValuationInput
-    comparables: List[ComparableInput]
+    comparables: list[ComparableInput]
 
 class IdealistaService:
     def __init__(self):
