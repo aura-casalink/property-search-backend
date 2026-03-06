@@ -1,32 +1,31 @@
 """
 dossier.py
 Genera el PDF del dossier de valoración de propiedad.
-
-Flujo:
-  1. Recibe datos de valoración (propiedad, comparables, precios)
-  2. Descarga mapa estático de OpenStreetMap/Mapbox
-  3. Genera PDF con reportlab
-  4. Devuelve bytes del PDF
+v2: Con mapa, layout corregido, fotos de comparables y logos de portales.
 """
 
 import io
 import os
-import math
 import httpx
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.lib.colors import HexColor, white, black
+from reportlab.lib.colors import HexColor, white
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # Colores AURA
 AURA_YELLOW = HexColor("#F5B800")
 AURA_DARK = HexColor("#1a1a1a")
 AURA_GRAY = HexColor("#6b7280")
 AURA_LIGHT_GRAY = HexColor("#f5f5f5")
+
+# URLs de logos de portales
+PORTAL_LOGOS = {
+    "idealista": "https://cdn.aura-app.es/img/portal_idealista.png",
+    "fotocasa": "https://cdn.aura-app.es/img/portal_fotocasa.png",
+    "habitaclia": "https://cdn.aura-app.es/img/portal_habitaclia.png",
+}
 
 def format_price(price):
     """Formatea precio en formato español: 1.234.567 €"""
@@ -40,32 +39,65 @@ def format_price_m2(price, area):
         return "-"
     return f"{int(price / area):,}".replace(",", ".") + " €/m²"
 
-async def fetch_map_image(lat, lng, zoom=16, width=400, height=200):
-    """Descarga imagen de mapa estático de OpenStreetMap via Mapbox o alternativa"""
-    
-    # Intentar con un tile server gratuito
-    # Usamos el estilo de OpenStreetMap directamente
+async def fetch_image(url: str, timeout: int = 10) -> bytes:
+    """Descarga una imagen desde URL"""
+    if not url:
+        return None
     try:
-        # Opción 1: Mapbox Static API (requiere token, pero tiene uno público de demo)
-        mapbox_token = os.getenv("MAPBOX_TOKEN", "")
-        url = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/pin-l+F5B800({lng},{lat})/{lng},{lat},{zoom},0/{width}x{height}@2x?access_token={mapbox_token}"
-        
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(url)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            headers = {"User-Agent": "Mozilla/5.0 AURA-Valuations/1.0"}
+            response = await client.get(url, headers=headers)
             if response.status_code == 200:
-                return response.content
+                content_type = response.headers.get("content-type", "")
+                if "image" in content_type or url.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                    return response.content
     except Exception as e:
-        print(f"[dossier] Error fetching Mapbox map: {e}")
+        print(f"[dossier] Error fetching image {url[:50]}...: {e}")
+    return None
+
+async def fetch_map_image(lat: float, lng: float, width: int = 400, height: int = 220) -> bytes:
+    """Descarga imagen de mapa estático"""
     
-    # Opción 2: OpenStreetMap Static Map (stadiamaps)
+    print(f"[dossier] Fetching map for coordinates: {lat}, {lng}")
+    
+    # Validar coordenadas
+    if not lat or not lng or lat == 0 or lng == 0:
+        print("[dossier] Invalid coordinates")
+        return None
+    
+    # Opción 1: Mapbox con token de env
+    mapbox_token = os.getenv("MAPBOX_TOKEN", "")
+    if mapbox_token:
+        try:
+            url = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/pin-l+F5B800({lng},{lat})/{lng},{lat},15,0/{width}x{height}@2x?access_token={mapbox_token}"
+            print(f"[dossier] Trying Mapbox...")
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                response = await client.get(url)
+                if response.status_code == 200:
+                    print(f"[dossier] ✅ Mapbox success")
+                    return response.content
+                else:
+                    print(f"[dossier] Mapbox returned {response.status_code}")
+        except Exception as e:
+            print(f"[dossier] Mapbox error: {e}")
+    else:
+        print("[dossier] No MAPBOX_TOKEN configured")
+    
+    # Opción 2: OpenStreetMap Static Maps (libre)
     try:
-        url = f"https://tiles.stadiamaps.com/static/osm_bright?center={lat},{lng}&zoom={zoom}&size={width}x{height}&markers={lat},{lng},red"
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(url)
+        # Usando staticmaps.openstreetmap.de
+        url = f"https://staticmap.openstreetmap.de/staticmap.php?center={lat},{lng}&zoom=15&size={width}x{height}&markers={lat},{lng},red"
+        print(f"[dossier] Trying OSM static...")
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            headers = {"User-Agent": "Mozilla/5.0 AURA-Valuations/1.0"}
+            response = await client.get(url, headers=headers)
             if response.status_code == 200:
+                print(f"[dossier] ✅ OSM success")
                 return response.content
+            else:
+                print(f"[dossier] OSM returned {response.status_code}")
     except Exception as e:
-        print(f"[dossier] Error fetching Stadia map: {e}")
+        print(f"[dossier] OSM error: {e}")
     
     return None
 
@@ -88,58 +120,11 @@ def draw_rounded_rect(c, x, y, width, height, radius, fill_color=None, stroke_co
         c.drawPath(p, fill=1, stroke=0)
     if stroke_color:
         c.setStrokeColor(stroke_color)
+        c.setLineWidth(0.5)
         c.drawPath(p, fill=0, stroke=1)
 
 async def generate_dossier_pdf(data: dict) -> bytes:
-    """
-    Genera el PDF del dossier de valoración.
-    
-    Args:
-        data: {
-            "property": {
-                "address": str,
-                "cadastre_ref": str,
-                "postal_code": str,
-                "total_area": float,
-                "rooms": int,
-                "bathrooms": int,
-                "floor": str,
-                "building_year": int,
-                "state": str,
-                "property_type": str
-            },
-            "coordinates": {"lat": float, "lng": float},
-            "valuation": {
-                "mean": float,
-                "min": float,
-                "max": float,
-                "std": float,
-                "count": int
-            },
-            "comparables": [
-                {
-                    "id": str,
-                    "title": str,
-                    "address": str,
-                    "price": float,
-                    "priceByArea": float,
-                    "size": float,
-                    "rooms": int,
-                    "bathrooms": int,
-                    "distance": float,
-                    "source": str,
-                    "url": str,
-                    "thumbnail": str,
-                    "selected": bool
-                }
-            ],
-            "price_min_avg": float,  # Media de 3 más baratos
-            "price_max_avg": float,  # Media de 3 más caros
-        }
-    
-    Returns:
-        bytes: Contenido del PDF
-    """
+    """Genera el PDF del dossier de valoración."""
     
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -154,266 +139,315 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     coords = data.get("coordinates", {})
     valuation = data.get("valuation", {})
     comparables = data.get("comparables", [])
-    selected_comparables = [c for c in comparables if c.get("selected", False)]
     
-    # Si no hay seleccionados, usar los que están in_range
+    print(f"[dossier] Property: {prop.get('address')}")
+    print(f"[dossier] Coordinates received: {coords}")
+    print(f"[dossier] Comparables count: {len(comparables)}")
+    
+    # Filtrar seleccionados
+    selected_comparables = [comp for comp in comparables if comp.get("selected", False) or comp.get("in_range", False)]
     if not selected_comparables:
-        selected_comparables = [c for c in comparables if c.get("in_range", False)]
+        selected_comparables = comparables[:10]
     
     # Calcular precios min/max (media de 3 más baratos/caros)
-    sorted_by_price = sorted([c for c in selected_comparables if c.get("price", 0) > 0], key=lambda x: x["price"])
+    sorted_by_price = sorted([comp for comp in selected_comparables if comp.get("price", 0) > 0], key=lambda x: x["price"])
     lowest_3 = sorted_by_price[:3]
     highest_3 = sorted_by_price[-3:] if len(sorted_by_price) >= 3 else sorted_by_price
     
-    price_min_avg = data.get("price_min_avg") or (sum(c["price"] for c in lowest_3) / len(lowest_3) if lowest_3 else 0)
-    price_max_avg = data.get("price_max_avg") or (sum(c["price"] for c in highest_3) / len(highest_3) if highest_3 else 0)
+    price_min_avg = sum(comp["price"] for comp in lowest_3) / len(lowest_3) if lowest_3 else 0
+    price_max_avg = sum(comp["price"] for comp in highest_3) / len(highest_3) if highest_3 else 0
     
     total_area = prop.get("total_area", 0)
     main_price = valuation.get("mean", 0)
     
     # ========== HEADER ==========
-    header_height = 20 * mm
+    header_height = 18 * mm
     c.setFillColor(AURA_DARK)
     c.rect(0, height - header_height, width, header_height, fill=1, stroke=0)
     
-    # Logo AURA
     c.setFillColor(AURA_YELLOW)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(margin, height - 14 * mm, "AURA Valuations")
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margin, height - 12 * mm, "AURA Valuations")
     
-    # Subtítulo
     c.setFillColor(HexColor("#999999"))
-    c.setFont("Helvetica", 9)
-    c.drawRightString(width - margin, height - 14 * mm, "Informe de Valoración")
+    c.setFont("Helvetica", 8)
+    c.drawRightString(width - margin, height - 12 * mm, "Informe de Valoración")
     
     # ========== TÍTULO (Dirección) ==========
-    y = height - header_height - 12 * mm
+    y = height - header_height - 10 * mm
     c.setFillColor(AURA_DARK)
-    c.setFont("Helvetica-Bold", 14)
+    c.setFont("Helvetica-Bold", 13)
     address = prop.get("address", "Dirección no disponible")
-    # Truncar si es muy largo
-    if len(address) > 60:
-        address = address[:57] + "..."
+    if len(address) > 55:
+        address = address[:52] + "..."
     c.drawString(margin, y, address)
     
-    y -= 8 * mm
+    y -= 5 * mm
     
     # ========== LAYOUT PRINCIPAL ==========
-    # Izquierda: Mapa (85mm ancho)
-    # Derecha: Precio y tarjetas
+    # Izquierda: Mapa (90mm) | Derecha: Precio + tarjetas
     
-    map_width = 85 * mm
-    map_height = 50 * mm
+    map_width = 90 * mm
+    map_height = 52 * mm
     map_x = margin
     map_y = y - map_height
     
-    # Intentar cargar imagen del mapa
+    # === CARGAR MAPA ===
     map_image = None
-    if coords.get("lat") and coords.get("lng"):
-        try:
-            map_bytes = await fetch_map_image(coords["lat"], coords["lng"])
-            if map_bytes:
-                map_image = ImageReader(io.BytesIO(map_bytes))
-        except Exception as e:
-            print(f"[dossier] Error loading map: {e}")
+    lat = coords.get("lat", 0)
+    lng = coords.get("lng", 0)
     
+    if lat and lng and lat != 0 and lng != 0:
+        map_bytes = await fetch_map_image(lat, lng)
+        if map_bytes:
+            try:
+                map_image = ImageReader(io.BytesIO(map_bytes))
+            except Exception as e:
+                print(f"[dossier] Error creating map image: {e}")
+    
+    # === DIBUJAR MAPA ===
     if map_image:
-        c.drawImage(map_image, map_x, map_y, width=map_width, height=map_height, preserveAspectRatio=True, mask='auto')
-    else:
-        # Placeholder del mapa
-        c.setFillColor(AURA_LIGHT_GRAY)
-        c.rect(map_x, map_y, map_width, map_height, fill=1, stroke=0)
+        try:
+            c.drawImage(map_image, map_x, map_y, width=map_width, height=map_height, preserveAspectRatio=True, mask='auto')
+        except Exception as e:
+            print(f"[dossier] Error drawing map: {e}")
+            map_image = None
+    
+    if not map_image:
+        draw_rounded_rect(c, map_x, map_y, map_width, map_height, 3*mm, fill_color=AURA_LIGHT_GRAY)
         c.setFillColor(AURA_GRAY)
-        c.setFont("Helvetica", 10)
+        c.setFont("Helvetica", 9)
         c.drawCentredString(map_x + map_width/2, map_y + map_height/2, "Mapa no disponible")
     
     # Borde del mapa
-    c.setStrokeColor(HexColor("#e5e5e5"))
+    c.setStrokeColor(HexColor("#e0e0e0"))
+    c.setLineWidth(0.5)
     c.rect(map_x, map_y, map_width, map_height, fill=0, stroke=1)
     
-    # ========== PRECIO (lado derecho del mapa) ==========
-    price_x = margin + map_width + 8 * mm
-    price_y = y - 5 * mm
+    # ========== VALORACIÓN (derecha del mapa) ==========
+    val_x = map_x + map_width + 8 * mm
+    val_width = content_width - map_width - 8 * mm
     
-    # Precio principal
+    # Precio principal (arriba)
+    price_y = y - 8 * mm
     c.setFillColor(AURA_YELLOW)
     c.setFont("Helvetica-Bold", 24)
-    c.drawString(price_x, price_y, format_price(main_price))
+    c.drawString(val_x, price_y, format_price(main_price))
     
     # Precio por m²
-    price_y -= 8 * mm
+    price_m2_y = price_y - 7 * mm
     c.setFillColor(AURA_GRAY)
-    c.setFont("Helvetica", 12)
-    c.drawString(price_x, price_y, format_price_m2(main_price, total_area))
+    c.setFont("Helvetica", 11)
+    c.drawString(val_x, price_m2_y, format_price_m2(main_price, total_area))
     
-    # ========== TARJETAS MIN/MAX ==========
-    card_y = price_y - 18 * mm
-    card_width = 38 * mm
-    card_height = 28 * mm
-    card_gap = 5 * mm
+    # === TARJETAS MIN/MAX (debajo del precio) ===
+    cards_top = price_m2_y - 8 * mm
+    card_width = (val_width - 3 * mm) / 2
+    card_height = 22 * mm
+    card_y = cards_top - card_height
     
     # Tarjeta Precio Mínimo
-    draw_rounded_rect(c, price_x, card_y, card_width, card_height, 3*mm, fill_color=AURA_LIGHT_GRAY)
+    draw_rounded_rect(c, val_x, card_y, card_width, card_height, 2*mm, fill_color=AURA_LIGHT_GRAY)
     
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 7)
-    c.drawCentredString(price_x + card_width/2, card_y + card_height - 7*mm, "Precio Mínimo")
+    c.drawCentredString(val_x + card_width/2, card_y + card_height - 6*mm, "Precio Mínimo")
     
-    c.setFillColor(AURA_DARK)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawCentredString(price_x + card_width/2, card_y + card_height - 14*mm, format_price(price_min_avg))
-    
-    c.setFillColor(AURA_GRAY)
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(price_x + card_width/2, card_y + card_height - 20*mm, format_price_m2(price_min_avg, total_area))
-    
-    # Tarjeta Precio Máximo
-    max_card_x = price_x + card_width + card_gap
-    draw_rounded_rect(c, max_card_x, card_y, card_width, card_height, 3*mm, fill_color=AURA_LIGHT_GRAY)
-    
-    c.setFillColor(AURA_GRAY)
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 7*mm, "Precio Máximo")
-    
-    c.setFillColor(AURA_DARK)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 14*mm, format_price(price_max_avg))
-    
-    c.setFillColor(AURA_GRAY)
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 20*mm, format_price_m2(price_max_avg, total_area))
-    
-    # ========== CARACTERÍSTICAS DEL INMUEBLE ==========
-    chars_y = map_y - 8 * mm
-    chars_height = 18 * mm
-    
-    draw_rounded_rect(c, margin, chars_y - chars_height, map_width, chars_height, 3*mm, fill_color=AURA_LIGHT_GRAY)
-    
-    # Superficie, Habitaciones, Baños
-    char_items = [
-        f"{prop.get('total_area', '-')} m²",
-        f"{prop.get('rooms', '-')} hab.",
-        f"{prop.get('bathrooms', '-')} baños"
-    ]
-    
-    char_width = map_width / 3
     c.setFillColor(AURA_DARK)
     c.setFont("Helvetica-Bold", 10)
+    c.drawCentredString(val_x + card_width/2, card_y + card_height - 13*mm, format_price(price_min_avg))
     
-    for i, item in enumerate(char_items):
-        x = margin + (i * char_width) + char_width/2
-        c.drawCentredString(x, chars_y - chars_height/2 - 2*mm, item)
+    c.setFillColor(AURA_GRAY)
+    c.setFont("Helvetica", 6)
+    c.drawCentredString(val_x + card_width/2, card_y + card_height - 18*mm, format_price_m2(price_min_avg, total_area))
     
-    # ========== SECCIÓN COMPARABLES ==========
-    comps_y = chars_y - chars_height - 12 * mm
+    # Tarjeta Precio Máximo
+    max_card_x = val_x + card_width + 3 * mm
+    draw_rounded_rect(c, max_card_x, card_y, card_width, card_height, 2*mm, fill_color=AURA_LIGHT_GRAY)
+    
+    c.setFillColor(AURA_GRAY)
+    c.setFont("Helvetica", 7)
+    c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 6*mm, "Precio Máximo")
     
     c.setFillColor(AURA_DARK)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, comps_y, "Propiedades Comparables")
+    c.setFont("Helvetica-Bold", 10)
+    c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 13*mm, format_price(price_max_avg))
     
-    comps_y -= 5 * mm
+    c.setFillColor(AURA_GRAY)
+    c.setFont("Helvetica", 6)
+    c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 18*mm, format_price_m2(price_max_avg, total_area))
     
-    # Mostrar hasta 4 comparables
+    # ========== CARACTERÍSTICAS (debajo del mapa, ancho completo) ==========
+    chars_y = map_y - 8 * mm
+    chars_height = 16 * mm
+    
+    draw_rounded_rect(c, margin, chars_y - chars_height, content_width, chars_height, 3*mm, 
+                      fill_color=HexColor("#fef9e7"), stroke_color=AURA_YELLOW)
+    
+    # Tres columnas con icono + valor
+    items = [
+        (f"{prop.get('total_area', '-')} m²", "Superficie"),
+        (f"{prop.get('rooms', '-')} hab.", "Habitaciones"),
+        (f"{prop.get('bathrooms', '-')} baños", "Baños"),
+    ]
+    
+    col_width = content_width / 3
+    for i, (value, label) in enumerate(items):
+        cx = margin + (i * col_width) + col_width / 2
+        
+        # Valor grande
+        c.setFillColor(AURA_DARK)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawCentredString(cx, chars_y - 7*mm, value)
+        
+        # Label pequeño
+        c.setFillColor(AURA_GRAY)
+        c.setFont("Helvetica", 7)
+        c.drawCentredString(cx, chars_y - 12*mm, label)
+    
+    # ========== SECCIÓN COMPARABLES ==========
+    comps_section_y = chars_y - chars_height - 10 * mm
+    
+    c.setFillColor(AURA_DARK)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(margin, comps_section_y, "Propiedades Comparables")
+    
+    comps_y = comps_section_y - 5 * mm
+    
+    # Preparar 4 comparables
     top_comparables = selected_comparables[:4]
-    if len(top_comparables) < 4:
+    if len(top_comparables) < 4 and len(comparables) >= 4:
         top_comparables = comparables[:4]
     
-    comp_card_width = (content_width - 15*mm) / 4
-    comp_card_height = 65 * mm
+    comp_card_width = (content_width - 9*mm) / 4
+    comp_card_height = 58 * mm
     
+    # Pre-cargar logos de portales
+    portal_images = {}
+    for portal, url in PORTAL_LOGOS.items():
+        img_bytes = await fetch_image(url)
+        if img_bytes:
+            try:
+                portal_images[portal] = ImageReader(io.BytesIO(img_bytes))
+                print(f"[dossier] ✅ Loaded logo: {portal}")
+            except Exception as e:
+                print(f"[dossier] Error loading logo {portal}: {e}")
+    
+    # Dibujar cada comparable
     for i, comp in enumerate(top_comparables):
-        cx = margin + (i * (comp_card_width + 5*mm))
+        cx = margin + (i * (comp_card_width + 3*mm))
         cy = comps_y - comp_card_height
         
         # Fondo de tarjeta
-        c.setFillColor(white)
-        c.setStrokeColor(HexColor("#e0e0e0"))
-        c.roundRect(cx, cy, comp_card_width, comp_card_height, 3*mm, fill=1, stroke=1)
+        draw_rounded_rect(c, cx, cy, comp_card_width, comp_card_height, 2*mm, 
+                          fill_color=white, stroke_color=HexColor("#e0e0e0"))
         
-        # Placeholder de imagen
+        # === FOTO ===
         img_height = 22 * mm
-        c.setFillColor(HexColor("#f0f0f0"))
-        c.rect(cx + 2*mm, cy + comp_card_height - img_height - 2*mm, comp_card_width - 4*mm, img_height, fill=1, stroke=0)
-        c.setFillColor(HexColor("#cccccc"))
-        c.setFont("Helvetica", 14)
-        c.drawCentredString(cx + comp_card_width/2, cy + comp_card_height - img_height/2 - 2*mm, "🏠")
+        img_width = comp_card_width - 4*mm
+        img_x = cx + 2*mm
+        img_y = cy + comp_card_height - img_height - 2*mm
         
-        # Precio
-        text_y = cy + comp_card_height - img_height - 10*mm
+        thumbnail_url = comp.get("thumbnail", "")
+        comp_image = None
+        
+        if thumbnail_url:
+            print(f"[dossier] Fetching thumbnail: {thumbnail_url[:60]}...")
+            img_bytes = await fetch_image(thumbnail_url)
+            if img_bytes:
+                try:
+                    comp_image = ImageReader(io.BytesIO(img_bytes))
+                except Exception as e:
+                    print(f"[dossier] Error loading thumbnail: {e}")
+        
+        if comp_image:
+            try:
+                c.drawImage(comp_image, img_x, img_y, width=img_width, height=img_height, 
+                           preserveAspectRatio=True, mask='auto')
+            except Exception as e:
+                print(f"[dossier] Error drawing thumbnail: {e}")
+                comp_image = None
+        
+        if not comp_image:
+            # Placeholder gris con icono
+            c.setFillColor(HexColor("#f0f0f0"))
+            c.rect(img_x, img_y, img_width, img_height, fill=1, stroke=0)
+            c.setFillColor(HexColor("#cccccc"))
+            c.setFont("Helvetica", 18)
+            c.drawCentredString(cx + comp_card_width/2, img_y + img_height/2 - 3*mm, "🏠")
+        
+        # === PRECIO ===
+        text_y = img_y - 6*mm
         c.setFillColor(AURA_DARK)
         c.setFont("Helvetica-Bold", 9)
-        price_text = format_price(comp.get("price", 0))
-        if len(price_text) > 12:
-            c.setFont("Helvetica-Bold", 8)
-        c.drawString(cx + 3*mm, text_y, price_text)
+        c.drawString(cx + 3*mm, text_y, format_price(comp.get("price", 0)))
         
         # Precio por m²
-        text_y -= 5*mm
+        text_y -= 4*mm
         c.setFillColor(AURA_GRAY)
         c.setFont("Helvetica", 6)
         c.drawString(cx + 3*mm, text_y, format_price_m2(comp.get("price", 0), comp.get("size", 0)))
         
         # Características
-        text_y -= 6*mm
+        text_y -= 5*mm
         c.setFont("Helvetica", 6)
-        details = f"{comp.get('rooms', '-')} hab. | {comp.get('bathrooms', '-')} baños | {comp.get('size', '-')} m²"
-        c.drawString(cx + 3*mm, text_y, details)
+        rooms = comp.get('rooms', '-')
+        baths = comp.get('bathrooms', '-')
+        size = comp.get('size', '-')
+        c.drawString(cx + 3*mm, text_y, f"{rooms} hab. · {baths} baños · {size} m²")
         
-        # Indicador de fuente (círculo de color)
-        source_colors = {
-            "idealista": HexColor("#22c55e"),  # Verde
-            "fotocasa": HexColor("#3b82f6"),   # Azul
-            "habitaclia": HexColor("#f97316"), # Naranja
-        }
-        source = comp.get("source", "idealista")
-        source_color = source_colors.get(source, AURA_GRAY)
+        # === LOGO DEL PORTAL (esquina inferior derecha) ===
+        source = comp.get("source", "idealista").lower()
+        if source in portal_images:
+            logo_width = 14 * mm
+            logo_height = 5 * mm
+            logo_x = cx + comp_card_width - logo_width - 2*mm
+            logo_y = cy + 2*mm
+            try:
+                c.drawImage(portal_images[source], logo_x, logo_y, 
+                           width=logo_width, height=logo_height, 
+                           preserveAspectRatio=True, mask='auto')
+            except:
+                pass
         
-        c.setFillColor(source_color)
-        c.circle(cx + comp_card_width - 5*mm, cy + 5*mm, 2*mm, fill=1, stroke=0)
-        
-        # Link "Ver →"
+        # Link "Ver propiedad →"
         c.setFillColor(HexColor("#3b82f6"))
         c.setFont("Helvetica", 6)
-        link_text = "Ver propiedad →"
-        c.drawString(cx + 3*mm, cy + 3*mm, link_text)
+        c.drawString(cx + 3*mm, cy + 3*mm, "Ver →")
         
-        # Añadir link clickeable
         url = comp.get("url", "")
         if url:
-            c.linkURL(url, (cx + 3*mm, cy + 1*mm, cx + 30*mm, cy + 6*mm))
+            c.linkURL(url, (cx + 2*mm, cy + 1*mm, cx + 20*mm, cy + 8*mm))
     
     # ========== FOOTER ==========
-    footer_height = 18 * mm
+    footer_height = 16 * mm
     c.setFillColor(AURA_DARK)
     c.rect(0, 0, width, footer_height, fill=1, stroke=0)
     
-    # Powered by AURA
     c.setFillColor(AURA_YELLOW)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(width/2, 10*mm, "Powered by AURA")
+    c.setFont("Helvetica-Bold", 9)
+    c.drawCentredString(width/2, 9*mm, "Powered by AURA")
     
-    c.setFillColor(HexColor("#999999"))
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(width/2, 5*mm, "Herramientas inteligentes para agencias inmobiliarias")
+    c.setFillColor(HexColor("#888888"))
+    c.setFont("Helvetica", 6)
+    c.drawCentredString(width/2, 4*mm, "Herramientas inteligentes para agencias inmobiliarias")
     
-    # Fecha de generación
+    # Fecha y comparables
     c.setFillColor(HexColor("#666666"))
     c.setFont("Helvetica", 6)
     today = datetime.now().strftime("%d/%m/%Y")
-    c.drawString(margin, footer_height + 3*mm, f"Generado: {today}")
-    
-    # Número de comparables
-    c.drawRightString(width - margin, footer_height + 3*mm, f"{len(selected_comparables)} comparables analizados")
+    c.drawString(margin, footer_height + 2*mm, f"Generado: {today}")
+    c.drawRightString(width - margin, footer_height + 2*mm, f"{len(selected_comparables)} comparables analizados")
     
     # Guardar
     c.save()
+    print(f"[dossier] ✅ PDF generated successfully")
     
     return buffer.getvalue()
 
 
 def generate_dossier_filename(address: str) -> str:
     """Genera nombre de archivo para el PDF"""
-    # Limpiar caracteres especiales
     clean = "".join(c if c.isalnum() or c in " -_" else "_" for c in address)
     clean = clean.replace(" ", "_")[:40]
     timestamp = datetime.now().strftime("%Y%m%d")
