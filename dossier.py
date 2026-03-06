@@ -1,6 +1,6 @@
 """
-dossier.py v7
-Alineación perfecta al thumbnail, nombre de archivo corregido.
+dossier.py v8
+Tarjetas de comparables con tamaño exacto del thumbnail.
 """
 
 import io
@@ -94,7 +94,7 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     valuation = data.get("valuation", {})
     comparables = data.get("comparables", [])
     
-    print(f"[dossier] === GENERATING PDF v7 ===")
+    print(f"[dossier] === GENERATING PDF v8 ===")
     print(f"[dossier] Address: {prop.get('address')}")
     
     selected_comparables = [comp for comp in comparables if comp.get("selected") or comp.get("in_range")]
@@ -262,15 +262,15 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     if len(top_comparables) < 4 and len(comparables) >= 4:
         top_comparables = comparables[:4]
     
+    # TAMAÑO DEL THUMBNAIL = TAMAÑO DE LA TARJETA
+    thumb_height = 38 * mm  # Altura del thumbnail
+    thumb_width = 38 * mm   # Ancho del thumbnail (cuadrado)
+    
+    # La tarjeta tiene exactamente la altura del thumbnail
+    comp_card_height = thumb_height
     comp_card_width = (content_width - 6*mm) / 2
-    comp_card_height = 46 * mm
     gap_x = 6 * mm
     gap_y = 4 * mm
-    
-    # Thumbnail ocupa casi toda la altura de la tarjeta
-    thumb_padding = 3 * mm
-    thumb_width = 40 * mm
-    thumb_height = comp_card_height - (thumb_padding * 2)  # ~40mm
     
     portal_images = {}
     for portal, url in PORTAL_LOGOS.items():
@@ -288,17 +288,16 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         cx = margin + col * (comp_card_width + gap_x)
         cy = comps_y - (row + 1) * comp_card_height - row * gap_y
         
+        # La tarjeta es exactamente del tamaño del thumbnail en altura
         c.setFillColor(white)
         c.rect(cx, cy, comp_card_width, comp_card_height, fill=1, stroke=0)
         c.setStrokeColor(HexColor("#e0e0e0"))
         c.setLineWidth(0.5)
         c.rect(cx, cy, comp_card_width, comp_card_height, fill=0, stroke=1)
         
-        # THUMBNAIL - posicionado con padding desde los bordes de la tarjeta
-        thumb_x = cx + thumb_padding
-        thumb_y = cy + thumb_padding
-        thumb_top_y = thumb_y + thumb_height  # Borde superior del thumbnail
-        thumb_bottom_y = thumb_y              # Borde inferior del thumbnail
+        # THUMBNAIL - pegado al borde izquierdo de la tarjeta
+        thumb_x = cx
+        thumb_y = cy
         
         thumbnail_url = comp.get("thumbnail", "")
         comp_image = None
@@ -325,44 +324,41 @@ async def generate_dossier_pdf(data: dict) -> bytes:
             c.setFont("Helvetica", 20)
             c.drawCentredString(thumb_x + thumb_width/2, thumb_y + thumb_height/2 - 3*mm, "🏠")
         
-        # INFO - alineada EXACTAMENTE con los bordes del thumbnail
-        info_x = thumb_x + thumb_width + 4 * mm
+        # INFO - alineada con los bordes del thumbnail
+        info_x = thumb_x + thumb_width + 3 * mm
+        thumb_top = thumb_y + thumb_height  # = cy + comp_card_height = borde superior
+        thumb_bottom = thumb_y              # = cy = borde inferior
         
-        # El texto debe ir desde thumb_top_y hasta thumb_bottom_y
-        # Distribución: Precio arriba, Ver propiedad abajo, resto en medio
-        
-        # PRECIO - exactamente en el borde superior del thumbnail
+        # PRECIO - alineado con el borde superior del thumbnail
         c.setFillColor(AURA_DARK)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(info_x, thumb_top_y - 3*mm, format_price(comp.get("price", 0)))
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(info_x, thumb_top - 4*mm, format_price(comp.get("price", 0)))
         
-        # €/m² - justo debajo del precio
+        # €/m²
         c.setFillColor(AURA_GRAY)
         c.setFont("Helvetica", 7)
-        c.drawString(info_x, thumb_top_y - 9*mm, format_price_m2(comp.get("price", 0), comp.get("size", 0)))
+        c.drawString(info_x, thumb_top - 9*mm, format_price_m2(comp.get("price", 0), comp.get("size", 0)))
         
-        # Habitaciones y baños - en el medio
-        c.drawString(info_x, thumb_top_y - 17*mm, f"{comp.get('rooms', '-')} hab. · {comp.get('bathrooms', '-')} baños")
+        # Características - en el medio
+        c.drawString(info_x, thumb_top - 16*mm, f"{comp.get('rooms', '-')} hab. · {comp.get('bathrooms', '-')} baños")
+        c.drawString(info_x, thumb_top - 21*mm, f"{comp.get('size', '-')} m²")
         
-        # Metros - debajo de hab/baños
-        c.drawString(info_x, thumb_top_y - 23*mm, f"{comp.get('size', '-')} m²")
-        
-        # VER PROPIEDAD - exactamente en el borde inferior del thumbnail
+        # VER PROPIEDAD - alineado con el borde inferior del thumbnail
         c.setFillColor(HexColor("#3b82f6"))
-        c.setFont("Helvetica", 7)
-        c.drawString(info_x, thumb_bottom_y, "Ver propiedad →")
+        c.setFont("Helvetica", 6)
+        c.drawString(info_x, thumb_bottom + 1*mm, "Ver propiedad →")
         
         url = comp.get("url", "")
         if url:
-            c.linkURL(url, (info_x, thumb_bottom_y - 2*mm, info_x + 28*mm, thumb_bottom_y + 5*mm))
+            c.linkURL(url, (info_x, thumb_bottom, info_x + 25*mm, thumb_bottom + 5*mm))
         
-        # LOGO - en el borde inferior derecho, alineado con "Ver propiedad"
+        # LOGO - esquina inferior derecha, alineado con el borde inferior
         source = comp.get("source", "idealista").lower()
         if source in portal_images:
-            logo_width = 14 * mm
-            logo_height = 5 * mm
-            logo_x = cx + comp_card_width - logo_width - thumb_padding
-            logo_y = thumb_bottom_y
+            logo_width = 12 * mm
+            logo_height = 4 * mm
+            logo_x = cx + comp_card_width - logo_width - 2*mm
+            logo_y = thumb_bottom + 1*mm
             try:
                 c.drawImage(portal_images[source], logo_x, logo_y, 
                            width=logo_width, height=logo_height, 
@@ -390,7 +386,7 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.drawRightString(width - margin, footer_height + 2*mm, f"{len(selected_comparables)} comparables analizados")
     
     c.save()
-    print(f"[dossier] ✅ PDF v7 generated")
+    print(f"[dossier] ✅ PDF v8 generated")
     
     return buffer.getvalue()
 
