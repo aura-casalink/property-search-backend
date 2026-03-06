@@ -1,11 +1,12 @@
 """
 dossier.py
 Genera el PDF del dossier de valoración de propiedad.
-v3: Layout 2x2 comparables, colores corregidos, mapa mejorado.
+v4: Rectángulos normales, alineación correcta, nombre mejorado.
 """
 
 import io
 import os
+import re
 import httpx
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
@@ -63,89 +64,74 @@ async def fetch_map_image(lat: float, lng: float, width: int = 400, height: int 
         print("[dossier] Invalid coordinates")
         return None
     
-    # Opción 1: Mapbox
+    # Opción 1: Mapbox con token de variable de entorno
     mapbox_token = os.getenv("MAPBOX_TOKEN", "")
-    if mapbox_token:
+    if mapbox_token and len(mapbox_token) > 50:
         try:
             url = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/pin-l+F5B800({lng},{lat})/{lng},{lat},15,0/{width}x{height}@2x?access_token={mapbox_token}"
-            print(f"[dossier] Trying Mapbox with token: {mapbox_token[:20]}...")
+            print(f"[dossier] Trying Mapbox...")
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 response = await client.get(url)
                 print(f"[dossier] Mapbox response: {response.status_code}")
-                if response.status_code == 200:
-                    print(f"[dossier] ✅ Mapbox success, size: {len(response.content)} bytes")
+                if response.status_code == 200 and len(response.content) > 5000:
+                    print(f"[dossier] ✅ Mapbox success")
                     return response.content
-                else:
-                    print(f"[dossier] Mapbox error body: {response.text[:200]}")
         except Exception as e:
-            print(f"[dossier] Mapbox exception: {e}")
-    else:
-        print("[dossier] No MAPBOX_TOKEN in environment")
+            print(f"[dossier] Mapbox error: {e}")
     
-    # Opción 2: Geoapify (gratis con API key demo)
+    # Opción 2: Thunderforest (OSM tiles con estilo limpio)
     try:
-        geoapify_key = os.getenv("GEOAPIFY_KEY", "")
-        if geoapify_key:
-            url = f"https://maps.geoapify.com/v1/staticmap?style=osm-bright&width={width}&height={height}&center=lonlat:{lng},{lat}&zoom=15&marker=lonlat:{lng},{lat};color:%23F5B800;size:large&apiKey={geoapify_key}"
-        else:
-            # Sin API key, usar demo limitado
-            url = f"https://maps.geoapify.com/v1/staticmap?style=osm-bright&width={width}&height={height}&center=lonlat:{lng},{lat}&zoom=15"
+        # Usando tiles de CartoCDN (gratis, sin auth)
+        import math
+        zoom = 15
+        n = 2 ** zoom
+        x_tile = int((lng + 180) / 360 * n)
+        lat_rad = math.radians(lat)
+        y_tile = int((1 - math.asinh(math.tan(lat_rad)) / math.pi) / 2 * n)
         
-        print(f"[dossier] Trying Geoapify...")
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            response = await client.get(url)
-            print(f"[dossier] Geoapify response: {response.status_code}")
-            if response.status_code == 200 and len(response.content) > 1000:
-                print(f"[dossier] ✅ Geoapify success")
-                return response.content
-    except Exception as e:
-        print(f"[dossier] Geoapify error: {e}")
-    
-    # Opción 3: OpenStreetMap Static Map API
-    try:
-        url = f"https://staticmap.openstreetmap.de/staticmap.php?center={lat},{lng}&zoom=15&size={width}x{height}&maptype=mapnik&markers={lat},{lng},red-pushpin"
-        print(f"[dossier] Trying OSM static map...")
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        # Cargar múltiples tiles para formar una imagen más grande
+        url = f"https://a.basemaps.cartocdn.com/rastertiles/voyager/{zoom}/{x_tile}/{y_tile}.png"
+        print(f"[dossier] Trying CartoCDN tile...")
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             headers = {"User-Agent": "Mozilla/5.0 AURA-Valuations/1.0"}
             response = await client.get(url, headers=headers)
-            print(f"[dossier] OSM response: {response.status_code}, size: {len(response.content)}")
-            if response.status_code == 200 and len(response.content) > 5000:
-                print(f"[dossier] ✅ OSM success")
+            print(f"[dossier] CartoCDN response: {response.status_code}, size: {len(response.content)}")
+            if response.status_code == 200 and len(response.content) > 1000:
+                print(f"[dossier] ✅ CartoCDN success")
                 return response.content
     except Exception as e:
-        print(f"[dossier] OSM error: {e}")
+        print(f"[dossier] CartoCDN error: {e}")
+    
+    # Opción 3: OpenStreetMap tiles directos
+    try:
+        import math
+        zoom = 15
+        n = 2 ** zoom
+        x_tile = int((lng + 180) / 360 * n)
+        lat_rad = math.radians(lat)
+        y_tile = int((1 - math.asinh(math.tan(lat_rad)) / math.pi) / 2 * n)
+        
+        url = f"https://tile.openstreetmap.org/{zoom}/{x_tile}/{y_tile}.png"
+        print(f"[dossier] Trying OSM tile: {url}")
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            headers = {"User-Agent": "Mozilla/5.0 AURA-Valuations/1.0 (contact@aura-app.es)"}
+            response = await client.get(url, headers=headers)
+            print(f"[dossier] OSM tile response: {response.status_code}")
+            if response.status_code == 200 and len(response.content) > 1000:
+                print(f"[dossier] ✅ OSM tile success")
+                return response.content
+    except Exception as e:
+        print(f"[dossier] OSM tile error: {e}")
     
     print("[dossier] ❌ All map providers failed")
     return None
-
-def draw_rounded_rect(c, x, y, width, height, radius, fill_color=None, stroke_color=None, stroke_width=0.5):
-    """Dibuja un rectángulo con esquinas redondeadas"""
-    p = c.beginPath()
-    p.moveTo(x + radius, y)
-    p.lineTo(x + width - radius, y)
-    p.arcTo(x + width - radius, y, x + width, y + radius, radius)
-    p.lineTo(x + width, y + height - radius)
-    p.arcTo(x + width, y + height - radius, x + width - radius, y + height, radius)
-    p.lineTo(x + radius, y + height)
-    p.arcTo(x + radius, y + height, x, y + height - radius, radius)
-    p.lineTo(x, y + radius)
-    p.arcTo(x, y + radius, x + radius, y, radius)
-    p.close()
-    
-    if fill_color:
-        c.setFillColor(fill_color)
-        c.drawPath(p, fill=1, stroke=0)
-    if stroke_color:
-        c.setStrokeColor(stroke_color)
-        c.setLineWidth(stroke_width)
-        c.drawPath(p, fill=0, stroke=1)
 
 async def generate_dossier_pdf(data: dict) -> bytes:
     """Genera el PDF del dossier de valoración."""
     
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4  # 210mm x 297mm
+    width, height = A4
     
     margin = 15 * mm
     content_width = width - (2 * margin)
@@ -228,11 +214,14 @@ async def generate_dossier_pdf(data: dict) -> bytes:
             map_image = None
     
     if not map_image:
-        draw_rounded_rect(c, map_x, map_y, map_width, map_height, 3*mm, fill_color=AURA_LIGHT_GRAY)
+        # Rectángulo normal para placeholder
+        c.setFillColor(AURA_LIGHT_GRAY)
+        c.rect(map_x, map_y, map_width, map_height, fill=1, stroke=0)
         c.setFillColor(AURA_GRAY)
         c.setFont("Helvetica", 9)
         c.drawCentredString(map_x + map_width/2, map_y + map_height/2, "Mapa no disponible")
     
+    # Borde del mapa
     c.setStrokeColor(HexColor("#e0e0e0"))
     c.setLineWidth(0.5)
     c.rect(map_x, map_y, map_width, map_height, fill=0, stroke=1)
@@ -245,8 +234,7 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     price_y = y - 12 * mm
     c.setFillColor(black)
     c.setFont("Helvetica-Bold", 26)
-    price_text = format_price(main_price)
-    c.drawCentredString(val_x + val_width/2, price_y, price_text)
+    c.drawCentredString(val_x + val_width/2, price_y, format_price(main_price))
     
     # Precio por m²
     price_m2_y = price_y - 8 * mm
@@ -254,15 +242,18 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.setFont("Helvetica", 11)
     c.drawCentredString(val_x + val_width/2, price_m2_y, format_price_m2(main_price, total_area))
     
-    # === TARJETAS MIN/MAX - Fondo amarillo ===
+    # === TARJETAS MIN/MAX - Rectángulos normales ===
     cards_top = price_m2_y - 10 * mm
     card_width = (val_width - 4 * mm) / 2
     card_height = 24 * mm
     card_y = cards_top - card_height
     
     # Tarjeta Mínimo
-    draw_rounded_rect(c, val_x, card_y, card_width, card_height, 2*mm, 
-                      fill_color=AURA_YELLOW_LIGHT, stroke_color=AURA_YELLOW)
+    c.setFillColor(AURA_YELLOW_LIGHT)
+    c.rect(val_x, card_y, card_width, card_height, fill=1, stroke=0)
+    c.setStrokeColor(AURA_YELLOW)
+    c.setLineWidth(1)
+    c.rect(val_x, card_y, card_width, card_height, fill=0, stroke=1)
     
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 7)
@@ -278,8 +269,11 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     
     # Tarjeta Máximo
     max_card_x = val_x + card_width + 4 * mm
-    draw_rounded_rect(c, max_card_x, card_y, card_width, card_height, 2*mm, 
-                      fill_color=AURA_YELLOW_LIGHT, stroke_color=AURA_YELLOW)
+    c.setFillColor(AURA_YELLOW_LIGHT)
+    c.rect(max_card_x, card_y, card_width, card_height, fill=1, stroke=0)
+    c.setStrokeColor(AURA_YELLOW)
+    c.setLineWidth(1)
+    c.rect(max_card_x, card_y, card_width, card_height, fill=0, stroke=1)
     
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 7)
@@ -293,13 +287,17 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.setFont("Helvetica", 6)
     c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 20*mm, format_price_m2(price_max_avg, total_area))
     
-    # ========== CARACTERÍSTICAS (debajo del mapa, mismo ancho que mapa) ==========
+    # ========== CARACTERÍSTICAS (debajo del mapa) ==========
     chars_y = map_y - 6 * mm
     chars_height = 16 * mm
-    chars_width = map_width  # Mismo ancho que el mapa
+    chars_width = map_width
     
-    draw_rounded_rect(c, margin, chars_y - chars_height, chars_width, chars_height, 3*mm, 
-                      fill_color=AURA_YELLOW_LIGHT, stroke_color=AURA_YELLOW)
+    # Rectángulo normal
+    c.setFillColor(AURA_YELLOW_LIGHT)
+    c.rect(margin, chars_y - chars_height, chars_width, chars_height, fill=1, stroke=0)
+    c.setStrokeColor(AURA_YELLOW)
+    c.setLineWidth(1)
+    c.rect(margin, chars_y - chars_height, chars_width, chars_height, fill=0, stroke=1)
     
     items = [
         (f"{prop.get('total_area', '-')} m²", "Superficie"),
@@ -319,7 +317,7 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         c.setFont("Helvetica", 7)
         c.drawCentredString(cx, chars_y - 12*mm, label)
     
-    # ========== COMPARABLES (2 columnas x 2 filas) ==========
+    # ========== COMPARABLES (2x2) ==========
     comps_section_y = chars_y - chars_height - 12 * mm
     
     c.setFillColor(AURA_DARK)
@@ -328,16 +326,19 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     
     comps_y = comps_section_y - 5 * mm
     
-    # 4 comparables en grid 2x2
     top_comparables = selected_comparables[:4]
     if len(top_comparables) < 4 and len(comparables) >= 4:
         top_comparables = comparables[:4]
     
     # Grid 2x2
     comp_card_width = (content_width - 6*mm) / 2
-    comp_card_height = 50 * mm
+    comp_card_height = 48 * mm
     gap_x = 6 * mm
     gap_y = 5 * mm
+    
+    # Tamaño del thumbnail (referencia para alineación)
+    thumb_width = 42 * mm
+    thumb_height = comp_card_height - 8 * mm
     
     # Pre-cargar logos
     portal_images = {}
@@ -357,15 +358,16 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         cx = margin + col * (comp_card_width + gap_x)
         cy = comps_y - (row + 1) * comp_card_height - row * gap_y
         
-        # Fondo tarjeta
-        draw_rounded_rect(c, cx, cy, comp_card_width, comp_card_height, 3*mm, 
-                          fill_color=white, stroke_color=HexColor("#e0e0e0"))
+        # Fondo tarjeta - rectángulo normal
+        c.setFillColor(white)
+        c.rect(cx, cy, comp_card_width, comp_card_height, fill=1, stroke=0)
+        c.setStrokeColor(HexColor("#e0e0e0"))
+        c.setLineWidth(0.5)
+        c.rect(cx, cy, comp_card_width, comp_card_height, fill=0, stroke=1)
         
-        # === FOTO (izquierda de la tarjeta) ===
-        img_width = 38 * mm
-        img_height = comp_card_height - 6 * mm
+        # === FOTO (izquierda) ===
         img_x = cx + 3 * mm
-        img_y = cy + 3 * mm
+        img_y = cy + 4 * mm
         
         thumbnail_url = comp.get("thumbnail", "")
         comp_image = None
@@ -380,24 +382,23 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         
         if comp_image:
             try:
-                c.drawImage(comp_image, img_x, img_y, width=img_width, height=img_height, 
+                c.drawImage(comp_image, img_x, img_y, width=thumb_width, height=thumb_height, 
                            preserveAspectRatio=True, mask='auto')
             except:
                 comp_image = None
         
         if not comp_image:
             c.setFillColor(HexColor("#f0f0f0"))
-            c.rect(img_x, img_y, img_width, img_height, fill=1, stroke=0)
+            c.rect(img_x, img_y, thumb_width, thumb_height, fill=1, stroke=0)
             c.setFillColor(HexColor("#cccccc"))
             c.setFont("Helvetica", 20)
-            c.drawCentredString(img_x + img_width/2, img_y + img_height/2 - 4*mm, "🏠")
+            c.drawCentredString(img_x + thumb_width/2, img_y + thumb_height/2 - 4*mm, "🏠")
         
-        # === INFO (derecha de la foto) ===
-        info_x = img_x + img_width + 4 * mm
-        info_width = comp_card_width - img_width - 10 * mm
+        # === INFO (derecha, alineada al thumbnail) ===
+        info_x = img_x + thumb_width + 4 * mm
         
-        # Precio
-        text_y = cy + comp_card_height - 10 * mm
+        # Precio - alineado arriba del thumbnail
+        text_y = img_y + thumb_height - 4 * mm
         c.setFillColor(AURA_DARK)
         c.setFont("Helvetica-Bold", 12)
         c.drawString(info_x, text_y, format_price(comp.get("price", 0)))
@@ -409,7 +410,7 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         c.drawString(info_x, text_y, format_price_m2(comp.get("price", 0), comp.get("size", 0)))
         
         # Características
-        text_y -= 7 * mm
+        text_y -= 8 * mm
         c.setFont("Helvetica", 8)
         rooms = comp.get('rooms', '-')
         baths = comp.get('bathrooms', '-')
@@ -419,7 +420,16 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         text_y -= 5 * mm
         c.drawString(info_x, text_y, f"{size} m²")
         
-        # === LOGO PORTAL (esquina inferior derecha) ===
+        # "Ver propiedad →" - alineado abajo del thumbnail
+        c.setFillColor(HexColor("#3b82f6"))
+        c.setFont("Helvetica", 7)
+        c.drawString(info_x, img_y + 2*mm, "Ver propiedad →")
+        
+        url = comp.get("url", "")
+        if url:
+            c.linkURL(url, (info_x, img_y, info_x + 30*mm, img_y + 8*mm))
+        
+        # === LOGO PORTAL (esquina inferior derecha de la tarjeta) ===
         source = comp.get("source", "idealista").lower()
         if source in portal_images:
             logo_width = 16 * mm
@@ -432,15 +442,6 @@ async def generate_dossier_pdf(data: dict) -> bytes:
                            preserveAspectRatio=True, mask='auto')
             except:
                 pass
-        
-        # "Ver propiedad →"
-        c.setFillColor(HexColor("#3b82f6"))
-        c.setFont("Helvetica", 7)
-        c.drawString(info_x, cy + 5*mm, "Ver propiedad →")
-        
-        url = comp.get("url", "")
-        if url:
-            c.linkURL(url, (info_x, cy + 2*mm, info_x + 30*mm, cy + 10*mm))
     
     # ========== FOOTER ==========
     footer_height = 16 * mm
@@ -469,8 +470,40 @@ async def generate_dossier_pdf(data: dict) -> bytes:
 
 
 def generate_dossier_filename(address: str) -> str:
-    """Genera nombre de archivo para el PDF"""
-    clean = "".join(c if c.isalnum() or c in " -_" else "_" for c in address)
-    clean = clean.replace(" ", "_")[:40]
-    timestamp = datetime.now().strftime("%Y%m%d")
-    return f"AURA_Valoracion_{clean}_{timestamp}.pdf"
+    """
+    Genera nombre de archivo para el PDF.
+    Formato: AAMMDD_HHMM_[calle]_[número]_valoración_by_AURA.pdf
+    """
+    now = datetime.now()
+    date_str = now.strftime("%y%m%d_%H%M")
+    
+    # Extraer calle y número de la dirección
+    # Ejemplo: "Calle Irun, 23" -> "Irun_23"
+    # Ejemplo: "Calle González Rubio, 6" -> "Gonzalez_Rubio_6"
+    
+    # Limpiar caracteres especiales
+    clean_address = address.replace("Calle ", "").replace("Avenida ", "").replace("Plaza ", "")
+    clean_address = clean_address.replace("C/ ", "").replace("Av. ", "").replace("Pz. ", "")
+    
+    # Quitar acentos
+    replacements = {
+        'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+        'Á': 'A', 'É': 'E', 'Í': 'I', 'Ó': 'O', 'Ú': 'U',
+        'ñ': 'n', 'Ñ': 'N', 'ü': 'u', 'Ü': 'U'
+    }
+    for old, new in replacements.items():
+        clean_address = clean_address.replace(old, new)
+    
+    # Solo alphanumeric y espacios/comas
+    clean_address = re.sub(r'[^a-zA-Z0-9\s,]', '', clean_address)
+    
+    # Separar por coma (calle, número)
+    parts = clean_address.split(',')
+    if len(parts) >= 2:
+        street = parts[0].strip().replace(' ', '_')[:30]
+        number = parts[1].strip().replace(' ', '')[:10]
+        location = f"{street}_{number}"
+    else:
+        location = clean_address.replace(' ', '_').replace(',', '_')[:40]
+    
+    return f"{date_str}_{location}_valoracion_by_AURA.pdf"
