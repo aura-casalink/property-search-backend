@@ -1,7 +1,6 @@
 """
-dossier.py
-Genera el PDF del dossier de valoración de propiedad.
-v5: Alineación centrada en comparables, nombre de archivo corregido.
+dossier.py v7
+Alineación perfecta al thumbnail, nombre de archivo corregido.
 """
 
 import io
@@ -16,14 +15,12 @@ from reportlab.lib.colors import HexColor, white, black
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-# Colores AURA
 AURA_YELLOW = HexColor("#F5B800")
 AURA_YELLOW_LIGHT = HexColor("#fef9e7")
 AURA_DARK = HexColor("#1a1a1a")
 AURA_GRAY = HexColor("#6b7280")
 AURA_LIGHT_GRAY = HexColor("#f5f5f5")
 
-# URLs de logos de portales
 PORTAL_LOGOS = {
     "idealista": "https://cdn.aura-app.es/img/portal_idealista.png",
     "fotocasa": "https://cdn.aura-app.es/img/portal_fotocasa.png",
@@ -31,19 +28,16 @@ PORTAL_LOGOS = {
 }
 
 def format_price(price):
-    """Formatea precio en formato español: 1.234.567 €"""
     if not price:
         return "-"
     return f"{int(price):,}".replace(",", ".") + " €"
 
 def format_price_m2(price, area):
-    """Calcula y formatea precio por m²"""
     if not price or not area:
         return "-"
     return f"{int(price / area):,}".replace(",", ".") + " €/m²"
 
 async def fetch_image(url: str, timeout: int = 10) -> bytes:
-    """Descarga una imagen desde URL"""
     if not url:
         return None
     try:
@@ -57,54 +51,37 @@ async def fetch_image(url: str, timeout: int = 10) -> bytes:
     return None
 
 async def fetch_map_image(lat: float, lng: float, width: int = 400, height: int = 250) -> bytes:
-    """Descarga imagen de mapa estático"""
-    
-    print(f"[dossier] Fetching map for: {lat}, {lng}")
-    
     if not lat or not lng or lat == 0 or lng == 0:
-        print("[dossier] Invalid coordinates")
         return None
     
-    # Mapbox con token de variable de entorno
     mapbox_token = os.getenv("MAPBOX_TOKEN", "")
     if mapbox_token and len(mapbox_token) > 50:
         try:
             url = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/pin-l+F5B800({lng},{lat})/{lng},{lat},15,0/{width}x{height}@2x?access_token={mapbox_token}"
-            print(f"[dossier] Trying Mapbox...")
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 response = await client.get(url)
-                print(f"[dossier] Mapbox response: {response.status_code}")
                 if response.status_code == 200 and len(response.content) > 5000:
-                    print(f"[dossier] ✅ Mapbox success")
                     return response.content
         except Exception as e:
             print(f"[dossier] Mapbox error: {e}")
     
-    # Fallback: CartoCDN tile
     try:
         zoom = 15
         n = 2 ** zoom
         x_tile = int((lng + 180) / 360 * n)
         lat_rad = math.radians(lat)
         y_tile = int((1 - math.asinh(math.tan(lat_rad)) / math.pi) / 2 * n)
-        
         url = f"https://a.basemaps.cartocdn.com/rastertiles/voyager/{zoom}/{x_tile}/{y_tile}.png"
-        print(f"[dossier] Trying CartoCDN...")
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            headers = {"User-Agent": "Mozilla/5.0 AURA-Valuations/1.0"}
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200 and len(response.content) > 1000:
-                print(f"[dossier] ✅ CartoCDN success")
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if response.status_code == 200:
                 return response.content
-    except Exception as e:
-        print(f"[dossier] CartoCDN error: {e}")
+    except:
+        pass
     
-    print("[dossier] ❌ All map providers failed")
     return None
 
 async def generate_dossier_pdf(data: dict) -> bytes:
-    """Genera el PDF del dossier de valoración."""
-    
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
@@ -112,23 +89,18 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     margin = 15 * mm
     content_width = width - (2 * margin)
     
-    # Datos
     prop = data.get("property", {})
     coords = data.get("coordinates", {})
     valuation = data.get("valuation", {})
     comparables = data.get("comparables", [])
     
-    print(f"[dossier] === GENERATING PDF ===")
+    print(f"[dossier] === GENERATING PDF v7 ===")
     print(f"[dossier] Address: {prop.get('address')}")
-    print(f"[dossier] Coordinates: {coords}")
-    print(f"[dossier] Comparables: {len(comparables)}")
     
-    # Filtrar seleccionados
-    selected_comparables = [comp for comp in comparables if comp.get("selected", False) or comp.get("in_range", False)]
+    selected_comparables = [comp for comp in comparables if comp.get("selected") or comp.get("in_range")]
     if not selected_comparables:
         selected_comparables = comparables[:10]
     
-    # Calcular precios min/max
     sorted_by_price = sorted([comp for comp in selected_comparables if comp.get("price", 0) > 0], key=lambda x: x["price"])
     lowest_3 = sorted_by_price[:3]
     highest_3 = sorted_by_price[-3:] if len(sorted_by_price) >= 3 else sorted_by_price
@@ -163,30 +135,28 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     
     y -= 5 * mm
     
-    # ========== LAYOUT: MAPA (izq) + VALORACIÓN (der) ==========
+    # ========== MAPA + VALORACIÓN ==========
     map_width = 88 * mm
     map_height = 55 * mm
     map_x = margin
     map_y = y - map_height
     
-    # === MAPA ===
     map_image = None
     lat = coords.get("lat", 0)
     lng = coords.get("lng", 0)
     
-    if lat and lng and lat != 0 and lng != 0:
+    if lat and lng:
         map_bytes = await fetch_map_image(lat, lng)
         if map_bytes:
             try:
                 map_image = ImageReader(io.BytesIO(map_bytes))
-            except Exception as e:
-                print(f"[dossier] Error creating ImageReader: {e}")
+            except:
+                pass
     
     if map_image:
         try:
             c.drawImage(map_image, map_x, map_y, width=map_width, height=map_height, preserveAspectRatio=True, mask='auto')
-        except Exception as e:
-            print(f"[dossier] Error drawing map: {e}")
+        except:
             map_image = None
     
     if not map_image:
@@ -200,29 +170,25 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.setLineWidth(0.5)
     c.rect(map_x, map_y, map_width, map_height, fill=0, stroke=1)
     
-    # ========== VALORACIÓN (derecha) ==========
+    # === VALORACIÓN ===
     val_x = map_x + map_width + 8 * mm
     val_width = content_width - map_width - 8 * mm
     
-    # PRECIO PRINCIPAL
     price_y = y - 12 * mm
     c.setFillColor(black)
     c.setFont("Helvetica-Bold", 26)
     c.drawCentredString(val_x + val_width/2, price_y, format_price(main_price))
     
-    # Precio por m²
     price_m2_y = price_y - 8 * mm
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 11)
     c.drawCentredString(val_x + val_width/2, price_m2_y, format_price_m2(main_price, total_area))
     
-    # === TARJETAS MIN/MAX ===
     cards_top = price_m2_y - 10 * mm
     card_width = (val_width - 4 * mm) / 2
     card_height = 24 * mm
     card_y = cards_top - card_height
     
-    # Tarjeta Mínimo
     c.setFillColor(AURA_YELLOW_LIGHT)
     c.rect(val_x, card_y, card_width, card_height, fill=1, stroke=0)
     c.setStrokeColor(AURA_YELLOW)
@@ -232,16 +198,13 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 7)
     c.drawCentredString(val_x + card_width/2, card_y + card_height - 6*mm, "Precio Mínimo")
-    
     c.setFillColor(AURA_DARK)
     c.setFont("Helvetica-Bold", 11)
     c.drawCentredString(val_x + card_width/2, card_y + card_height - 14*mm, format_price(price_min_avg))
-    
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 6)
     c.drawCentredString(val_x + card_width/2, card_y + card_height - 20*mm, format_price_m2(price_min_avg, total_area))
     
-    # Tarjeta Máximo
     max_card_x = val_x + card_width + 4 * mm
     c.setFillColor(AURA_YELLOW_LIGHT)
     c.rect(max_card_x, card_y, card_width, card_height, fill=1, stroke=0)
@@ -252,16 +215,14 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 7)
     c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 6*mm, "Precio Máximo")
-    
     c.setFillColor(AURA_DARK)
     c.setFont("Helvetica-Bold", 11)
     c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 14*mm, format_price(price_max_avg))
-    
     c.setFillColor(AURA_GRAY)
     c.setFont("Helvetica", 6)
     c.drawCentredString(max_card_x + card_width/2, card_y + card_height - 20*mm, format_price_m2(price_max_avg, total_area))
     
-    # ========== CARACTERÍSTICAS (debajo del mapa) ==========
+    # ========== CARACTERÍSTICAS ==========
     chars_y = map_y - 6 * mm
     chars_height = 16 * mm
     chars_width = map_width
@@ -281,11 +242,9 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     col_width = chars_width / 3
     for i, (value, label) in enumerate(items):
         cx = margin + (i * col_width) + col_width / 2
-        
         c.setFillColor(AURA_DARK)
         c.setFont("Helvetica-Bold", 11)
         c.drawCentredString(cx, chars_y - 6*mm, value)
-        
         c.setFillColor(AURA_GRAY)
         c.setFont("Helvetica", 7)
         c.drawCentredString(cx, chars_y - 12*mm, label)
@@ -303,17 +262,16 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     if len(top_comparables) < 4 and len(comparables) >= 4:
         top_comparables = comparables[:4]
     
-    # Grid 2x2
     comp_card_width = (content_width - 6*mm) / 2
-    comp_card_height = 48 * mm
+    comp_card_height = 46 * mm
     gap_x = 6 * mm
-    gap_y = 5 * mm
+    gap_y = 4 * mm
     
-    # Tamaño del thumbnail
-    thumb_width = 42 * mm
-    thumb_height = comp_card_height - 8 * mm  # 40mm
+    # Thumbnail ocupa casi toda la altura de la tarjeta
+    thumb_padding = 3 * mm
+    thumb_width = 40 * mm
+    thumb_height = comp_card_height - (thumb_padding * 2)  # ~40mm
     
-    # Pre-cargar logos
     portal_images = {}
     for portal, url in PORTAL_LOGOS.items():
         img_bytes = await fetch_image(url)
@@ -323,7 +281,6 @@ async def generate_dossier_pdf(data: dict) -> bytes:
             except:
                 pass
     
-    # Dibujar comparables
     for i, comp in enumerate(top_comparables):
         col = i % 2
         row = i // 2
@@ -331,16 +288,17 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         cx = margin + col * (comp_card_width + gap_x)
         cy = comps_y - (row + 1) * comp_card_height - row * gap_y
         
-        # Fondo tarjeta
         c.setFillColor(white)
         c.rect(cx, cy, comp_card_width, comp_card_height, fill=1, stroke=0)
         c.setStrokeColor(HexColor("#e0e0e0"))
         c.setLineWidth(0.5)
         c.rect(cx, cy, comp_card_width, comp_card_height, fill=0, stroke=1)
         
-        # === FOTO (izquierda, centrada verticalmente) ===
-        img_x = cx + 3 * mm
-        img_y = cy + (comp_card_height - thumb_height) / 2  # Centrado vertical
+        # THUMBNAIL - posicionado con padding desde los bordes de la tarjeta
+        thumb_x = cx + thumb_padding
+        thumb_y = cy + thumb_padding
+        thumb_top_y = thumb_y + thumb_height  # Borde superior del thumbnail
+        thumb_bottom_y = thumb_y              # Borde inferior del thumbnail
         
         thumbnail_url = comp.get("thumbnail", "")
         comp_image = None
@@ -355,59 +313,56 @@ async def generate_dossier_pdf(data: dict) -> bytes:
         
         if comp_image:
             try:
-                c.drawImage(comp_image, img_x, img_y, width=thumb_width, height=thumb_height, 
+                c.drawImage(comp_image, thumb_x, thumb_y, width=thumb_width, height=thumb_height, 
                            preserveAspectRatio=True, mask='auto')
             except:
                 comp_image = None
         
         if not comp_image:
             c.setFillColor(HexColor("#f0f0f0"))
-            c.rect(img_x, img_y, thumb_width, thumb_height, fill=1, stroke=0)
+            c.rect(thumb_x, thumb_y, thumb_width, thumb_height, fill=1, stroke=0)
             c.setFillColor(HexColor("#cccccc"))
             c.setFont("Helvetica", 20)
-            c.drawCentredString(img_x + thumb_width/2, img_y + thumb_height/2 - 4*mm, "🏠")
+            c.drawCentredString(thumb_x + thumb_width/2, thumb_y + thumb_height/2 - 3*mm, "🏠")
         
-        # === INFO (derecha, alineada con los bordes del thumbnail) ===
-        info_x = img_x + thumb_width + 5 * mm
+        # INFO - alineada EXACTAMENTE con los bordes del thumbnail
+        info_x = thumb_x + thumb_width + 4 * mm
         
-        # Calcular posiciones alineadas al thumbnail
-        thumb_top = img_y + thumb_height
-        thumb_bottom = img_y
+        # El texto debe ir desde thumb_top_y hasta thumb_bottom_y
+        # Distribución: Precio arriba, Ver propiedad abajo, resto en medio
         
-        # Precio - alineado con el borde superior del thumbnail
+        # PRECIO - exactamente en el borde superior del thumbnail
         c.setFillColor(AURA_DARK)
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(info_x, thumb_top - 4 * mm, format_price(comp.get("price", 0)))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(info_x, thumb_top_y - 3*mm, format_price(comp.get("price", 0)))
         
-        # €/m² - debajo del precio
+        # €/m² - justo debajo del precio
         c.setFillColor(AURA_GRAY)
-        c.setFont("Helvetica", 8)
-        c.drawString(info_x, thumb_top - 10 * mm, format_price_m2(comp.get("price", 0), comp.get("size", 0)))
+        c.setFont("Helvetica", 7)
+        c.drawString(info_x, thumb_top_y - 9*mm, format_price_m2(comp.get("price", 0), comp.get("size", 0)))
         
-        # Características - en el medio
-        c.setFont("Helvetica", 8)
-        rooms = comp.get('rooms', '-')
-        baths = comp.get('bathrooms', '-')
-        size = comp.get('size', '-')
-        c.drawString(info_x, thumb_top - 18 * mm, f"{rooms} hab. · {baths} baños")
-        c.drawString(info_x, thumb_top - 24 * mm, f"{size} m²")
+        # Habitaciones y baños - en el medio
+        c.drawString(info_x, thumb_top_y - 17*mm, f"{comp.get('rooms', '-')} hab. · {comp.get('bathrooms', '-')} baños")
         
-        # "Ver propiedad →" - alineado con el borde inferior del thumbnail
+        # Metros - debajo de hab/baños
+        c.drawString(info_x, thumb_top_y - 23*mm, f"{comp.get('size', '-')} m²")
+        
+        # VER PROPIEDAD - exactamente en el borde inferior del thumbnail
         c.setFillColor(HexColor("#3b82f6"))
         c.setFont("Helvetica", 7)
-        c.drawString(info_x, thumb_bottom + 1 * mm, "Ver propiedad →")
+        c.drawString(info_x, thumb_bottom_y, "Ver propiedad →")
         
         url = comp.get("url", "")
         if url:
-            c.linkURL(url, (info_x, thumb_bottom, info_x + 30*mm, thumb_bottom + 6*mm))
+            c.linkURL(url, (info_x, thumb_bottom_y - 2*mm, info_x + 28*mm, thumb_bottom_y + 5*mm))
         
-        # === LOGO PORTAL (esquina inferior derecha) ===
+        # LOGO - en el borde inferior derecho, alineado con "Ver propiedad"
         source = comp.get("source", "idealista").lower()
         if source in portal_images:
-            logo_width = 16 * mm
-            logo_height = 5.5 * mm
-            logo_x = cx + comp_card_width - logo_width - 4*mm
-            logo_y = thumb_bottom + 1*mm
+            logo_width = 14 * mm
+            logo_height = 5 * mm
+            logo_x = cx + comp_card_width - logo_width - thumb_padding
+            logo_y = thumb_bottom_y
             try:
                 c.drawImage(portal_images[source], logo_x, logo_y, 
                            width=logo_width, height=logo_height, 
@@ -428,7 +383,6 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.setFont("Helvetica", 6)
     c.drawCentredString(width/2, 4*mm, "Herramientas inteligentes para agencias inmobiliarias")
     
-    # Fecha y comparables
     c.setFillColor(HexColor("#666666"))
     c.setFont("Helvetica", 6)
     today = datetime.now().strftime("%d/%m/%Y")
@@ -436,47 +390,33 @@ async def generate_dossier_pdf(data: dict) -> bytes:
     c.drawRightString(width - margin, footer_height + 2*mm, f"{len(selected_comparables)} comparables analizados")
     
     c.save()
-    print(f"[dossier] ✅ PDF generated")
+    print(f"[dossier] ✅ PDF v7 generated")
     
     return buffer.getvalue()
 
 
 def generate_dossier_filename(address: str) -> str:
-    """
-    Genera nombre de archivo para el PDF.
-    Formato: AAMMDD_HHMM_[calle]_[número]_valoracion_by_AURA.pdf
-    Ejemplo: 260306_1435_Juan_Bautista_De_Toledo_17_valoracion_by_AURA.pdf
-    """
+    """AAMMDD_HHMM_[calle]_[número]_valoracion_by_AURA.pdf"""
     now = datetime.now()
     date_str = now.strftime("%y%m%d_%H%M")
     
-    # Limpiar prefijos comunes
     clean = address
-    prefixes = ["Calle ", "C/ ", "C. ", "Avenida ", "Av. ", "Av ", "Plaza ", "Pz. ", "Paseo ", "Pº "]
-    for prefix in prefixes:
+    for prefix in ["Calle ", "C/ ", "C. ", "Avenida ", "Av. ", "Av ", "Plaza ", "Pz. ", "Paseo ", "Pº "]:
         if clean.startswith(prefix):
             clean = clean[len(prefix):]
             break
     
-    # Quitar acentos
-    replacements = {
-        'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
-        'Á': 'A', 'É': 'E', 'Í': 'I', 'Ó': 'O', 'Ú': 'U',
-        'ñ': 'n', 'Ñ': 'N', 'ü': 'u', 'Ü': 'U'
-    }
-    for old, new in replacements.items():
+    for old, new in {'á':'a', 'é':'e', 'í':'i', 'ó':'o', 'ú':'u', 'Á':'A', 'É':'E', 'Í':'I', 'Ó':'O', 'Ú':'U', 'ñ':'n', 'Ñ':'N', 'ü':'u', 'Ü':'U'}.items():
         clean = clean.replace(old, new)
     
-    # Solo alphanumeric, espacios y comas
     clean = re.sub(r'[^a-zA-Z0-9\s,]', '', clean)
     
-    # Separar calle y número por coma
     parts = clean.split(',')
     if len(parts) >= 2:
-        street = parts[0].strip().replace(' ', '_')[:35]
+        street = parts[0].strip().replace(' ', '_')[:30]
         number = parts[1].strip().replace(' ', '')[:10]
         location = f"{street}_{number}"
     else:
-        location = clean.replace(' ', '_').replace(',', '_')[:40]
+        location = clean.replace(' ', '_')[:35]
     
     return f"{date_str}_{location}_valoracion_by_AURA.pdf"
