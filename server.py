@@ -603,6 +603,7 @@ async def search_comparables(request: SearchComparablesRequest):
             prop_id = f"{c.get('CodEmp', '')}-{c.get('CodInm', '')}"
             url = f"https://www.habitaclia.com/vivienda-{prop_id}.htm"
             thumbnail = ""
+            images = []  # Habitaclia no incluye imágenes en scrape de clusters
             # Coordenadas ya normalizadas desde Point.Lat/Point.Lon
             lat = c.get("latitude")
             lng = c.get("longitude")
@@ -617,9 +618,10 @@ async def search_comparables(request: SearchComparablesRequest):
             title = f"{rooms} hab, {size}m² - {address}" if rooms and size else subtype.capitalize()
             prop_id = c.get("propertyId") or c.get("id", "").replace("1_", "")
             url = c.get("urlMarketplace") or f"https://www.fotocasa.es/es/comprar/vivienda/{prop_id}"
-            # Thumbnail desde mediaList
+            # Imágenes desde mediaList
             media_list = c.get("mediaList", [])
             thumbnail = media_list[0].get("url", "") if media_list else ""
+            images = [m.get("url") for m in media_list if m.get("url")]
             lat = c.get("latitude")
             lng = c.get("longitude")
         else:
@@ -633,6 +635,7 @@ async def search_comparables(request: SearchComparablesRequest):
             prop_id = c.get("propertyCode") or c.get("id")
             url = c.get("url", "")
             thumbnail = c.get("thumbnail", "")
+            images = [img.get("url") for img in c.get("multimedia", []) if img.get("url")]
             lat = c.get("latitude")
             lng = c.get("longitude")
         
@@ -656,6 +659,7 @@ async def search_comparables(request: SearchComparablesRequest):
             "status": c.get("status"),
             "url": url,
             "thumbnail": thumbnail,
+            "images": images,
             "distance": round(distance) if distance < 90000 else None,
             "call_level": c.get("_call_level", 0),
             "score": round(c.get("_score", 0)),
