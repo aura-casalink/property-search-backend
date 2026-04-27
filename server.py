@@ -7,6 +7,7 @@ import os
 import json
 import httpx
 import math
+import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -70,8 +71,9 @@ class SearchComparablesRequest(BaseModel):
     total_area: float = 0
     rooms: int = 0
     bathrooms: int = 0
-    state: str = "buen_estado"
-    property_type: str = "piso"
+    state: str = "good"             # canonical: "good" | "renew" | "newDevelopment" (acepta legacy "buen_estado"/"a_reformar"/"obra_nueva")
+    property_type: str = "flat"     # canonical: "flat"/"penthouse"/etc. (acepta legacy "piso"/"atico"/etc.)
+    floor: Optional[str] = None     # NEW (para floor_tier_match en scoring full)
     extras: ExtrasInput = ExtrasInput()
     special_situation: SpecialSituationInput = SpecialSituationInput()
     cadastre_ref: Optional[str] = None
@@ -319,7 +321,176 @@ async def search_comparables(request: SearchComparablesRequest):
         return result
     
     def map_state(state):
-        return {"obra_nueva": "newdevelopment", "buen_estado": "good"}.get(state, "renew")
+        # Acepta vocabulario frontend (canonical) Y legacy español, normaliza a Idealista
+        s = (state or "").strip()
+        return {
+            # Frontend canonical
+            "newDevelopment": "newdevelopment",
+            "good": "good",
+            "renew": "renew",
+            # Legacy español
+            "obra_nueva": "newdevelopment",
+            "buen_estado": "good",
+            "a_reformar": "renew",
+        }.get(s, "good")
+    
+    def normalize_state_canonical(state):
+        # Devuelve el state en formato canonical (frontend) para usar en _norm.status match
+        s = (state or "").strip()
+        if s in ("newDevelopment", "obra_nueva"):
+            return "newdevelopment"
+        if s in ("good", "buen_estado"):
+            return "good"
+        if s in ("renew", "a_reformar"):
+            return "renew"
+        return "good"
+    
+    def normalize_propertytype(pt):
+        # Vocabulario común. Acepta frontend (flat/penthouse/etc.) y legacy español (piso/atico/etc.)
+        s = (pt or "").lower().strip()
+        return {
+            # Frontend canonical (passthrough)
+            "flat": "flat", "penthouse": "penthouse", "duplex": "duplex",
+            "studio": "studio", "chalet": "chalet", "house": "house",
+            "countryhouse": "countryhouse",
+            # Legacy español
+            "piso": "flat", "apartamento": "flat",
+            "atico": "penthouse", "ático": "penthouse",
+            "loft": "loft",
+            "chalet_independiente": "chalet", "chalet_pareado": "chalet", "chalet_adosado": "chalet",
+            "casa_rustica": "countryhouse", "villa": "villa",
+            # Idealista detail / Fotocasa subtype values
+            "homes": "flat",  # default genérico
+            "single-family-house": "house", "house": "house",
+        }.get(s, s)  # fallback: passthrough lowercased
+    
+    def floor_tier(floor_str):
+        # Devuelve "low" | "mid" | "high" | None. Robusto a varios formatos.
+        if floor_str is None:
+            return None
+        f = str(floor_str).upper().strip().replace("º", "").replace("ª", "")
+        if not f:
+            return None
+        # Bajos / sótanos / semis / planta baja / entresuelo / principal
+        if f in ("BAJO", "BJ", "B", "SS", "ST", "SOTANO", "SÓTANO", "PB", "PR", "PRINCIPAL", "ENTLO", "ENTRESUELO", "EN"):
+            return "low"
+        # Áticos = high
+        if f in ("AT", "ATICO", "ÁTICO", "PENTHOUSE"):
+            return "high"
+        # Fotocasa floorType strings
+        ft_map = {
+            "GROUND": "low", "BASEMENT": "low", "SUBBASEMENT": "low",
+            "FIRST": "mid", "SECOND": "mid", "THIRD": "mid",
+            "FOURTH": "high", "FIFTH": "high", "SIXTH": "high", "SEVENTH": "high",
+            "EIGHTH": "high", "NINTH": "high", "TENTH": "high", "PENTHOUSE": "high",
+        }
+        for key, tier in ft_map.items():
+            if key in f:
+                return tier
+        # Numérico (incluye "3rd floor", "1", "01", etc.)
+        m = re.search(r"\b(\d+)\b", f)
+        if m:
+            try:
+                n = int(m.group(1))
+                if n == 0: return "low"
+                if n <= 3: return "mid"
+                return "high"
+            except (ValueError, TypeError):
+                pass
+        return None
+    
+    def parse_haslift_from_description(features_arr):
+        # HAB DescriptionFeatures parser. Devuelve True/False/None.
+        if not features_arr or not isinstance(features_arr, list):
+            return None
+        joined = " ".join(str(f).lower() for f in features_arr)
+        if "sin ascensor" in joined:
+            return False
+        if "ascensor" in joined:
+            return True
+        return None
+    
+    def parse_exterior_from_description(features_arr):
+        # HAB DescriptionFeatures parser. Devuelve True/False/None.
+        if not features_arr or not isinstance(features_arr, list):
+            return None
+        joined = " ".join(str(f).lower() for f in features_arr)
+        if "exterior" in joined:
+            return True
+        if "interior" in joined:
+            return False
+        return None
+    
+    def normalize_comparable(comp):
+        # Normaliza campos de cualquier source a un dict `_norm` canónico.
+        # Idempotente: se puede llamar dos veces (post-enrichment HAB) sin efectos secundarios.
+        src = comp.get("_source", "idealista")
+        n = comp.get("_norm") or {}
+        
+        if src == "idealista":
+            n["price"]        = comp.get("price")
+            n["size"]         = comp.get("size")
+            n["rooms"]        = comp.get("rooms")
+            n["bathrooms"]    = comp.get("bathrooms")
+            n["lat"]          = comp.get("latitude")
+            n["lng"]          = comp.get("longitude")
+            n["propertytype"] = normalize_propertytype(comp.get("propertyType"))
+            n["newdev"]       = bool(comp.get("newDevelopment"))
+            n["status"]       = comp.get("status")  # "good" | "renew" | "newdevelopment"
+            n["exterior"]     = comp.get("exterior")
+            n["haslift"]      = comp.get("hasLift")
+            n["hasplan"]      = bool(comp.get("hasPlan"))
+            n["numphotos"]    = comp.get("numPhotos") or 0
+            n["floor_tier"]   = floor_tier(comp.get("floor"))
+        
+        elif src == "fotocasa":
+            n["price"]        = comp.get("price")
+            n["size"]         = comp.get("surface")
+            n["rooms"]        = comp.get("rooms")
+            n["bathrooms"]    = comp.get("bathrooms")
+            n["lat"]          = comp.get("latitude")
+            n["lng"]          = comp.get("longitude")
+            n["propertytype"] = normalize_propertytype(comp.get("propertySubtype"))
+            isdev = comp.get("isDevelopment")
+            n["newdev"]       = isdev is True or isdev == "true"
+            n["status"]       = None  # solo en detail FC; no consultamos
+            n["exterior"]     = any(f.get("feature") == "IS_EXTERIOR" for f in (comp.get("dynamicFeatures") or []))
+            extras_str        = (comp.get("extraList") or "")
+            extras_set        = set(extras_str.split())
+            n["haslift"]      = "13" in extras_set
+            n["hasplan"]      = bool(comp.get("hasDescriptionPlan"))
+            n["numphotos"]    = len(comp.get("mediaList") or [])
+            floor_obj         = comp.get("propertyFloor") or {}
+            n["floor_tier"]   = floor_tier(floor_obj.get("floorType") or floor_obj.get("description"))
+        
+        elif src == "habitaclia":
+            n["price"]        = comp.get("PvpInm")
+            n["size"]         = comp.get("M2Inm")
+            n["rooms"]        = comp.get("NumHab")
+            n["bathrooms"]    = comp.get("NumBany")
+            # Coordenadas: prioridad detail (Map.VGPSLat/VGPSLon) > scrape (Point.Lat/Lon)
+            map_obj           = comp.get("Map") or {}
+            point_obj         = comp.get("Point") or {}
+            n["lat"]          = map_obj.get("VGPSLat") or point_obj.get("Lat")
+            n["lng"]          = map_obj.get("VGPSLon") or point_obj.get("Lon")
+            n["propertytype"] = normalize_propertytype(comp.get("DescSubtipoBuscador"))
+            n["newdev"]       = bool(comp.get("ObraNueva"))
+            n["status"]       = None  # no en scrape ni detail
+            # exterior y haslift solo después de enrichment (DescriptionFeatures)
+            desc_features     = comp.get("DescriptionFeatures")
+            if desc_features is not None:
+                n["exterior"] = parse_exterior_from_description(desc_features)
+                n["haslift"]  = parse_haslift_from_description(desc_features)
+            else:
+                n["exterior"] = n.get("exterior")  # preservar si ya estaba
+                n["haslift"]  = n.get("haslift")
+            n["hasplan"]      = None  # HAB no tiene equivalente
+            # numphotos: scrape no aporta info fiable (NumImg1=0 basura). Detail: ImageCount o len(Images).
+            n["numphotos"]    = comp.get("ImageCount") or len(comp.get("Images") or [])
+            n["floor_tier"]   = None  # HAB no expone floor en scrape ni detail
+        
+        comp["_norm"] = n
+        return n
     
     def calc_distance(lat1, lng1, lat2, lng2):
         R = 6371000
@@ -394,12 +565,17 @@ async def search_comparables(request: SearchComparablesRequest):
                 "order": "publicationDate",
             }
             
-            # Añadir filtros de tipo
+            # Añadir filtros de tipo. Acepta vocabulario frontend canonical Y legacy español.
             type_map = {
+                # Legacy español
                 "atico": "penthouse", "duplex": "duplex", "apartamento": "apartamentoType",
                 "loft": "loftType", "chalet_independiente": "independentHouse",
                 "chalet_pareado": "semidetachedHouse", "chalet_adosado": "terracedHouse",
-                "casa_rustica": "countryHouse", "villa": "villaType", "piso": "flat"
+                "casa_rustica": "countryHouse", "villa": "villaType", "piso": "flat",
+                # Frontend canonical
+                "flat": "flat", "penthouse": "penthouse",
+                "studio": "studioType", "countryHouse": "countryHouse",
+                # "chalet" y "house" sin filtro específico (ambiguos: independiente/pareado/adosado)
             }
             if request.property_type in type_map:
                 idealista_params[type_map[request.property_type]] = True
@@ -530,76 +706,182 @@ async def search_comparables(request: SearchComparablesRequest):
                 print(f"✅ Suficientes comparables ({total}), parando búsqueda")
                 break
     
-    # Calcular scores y rankear
+    # ═══════════════════════════════════════════════════════════════════
+    # FASE 1.5 — NORMALIZACIÓN: escribir comp["_norm"] canonical para todos
+    # ═══════════════════════════════════════════════════════════════════
     for comp in all_comparables:
-        source = comp.get("_source", "idealista")
-        # Obtener coordenadas según fuente
-        if source == "habitaclia":
-            comp_lat = comp.get("Lat") or comp.get("latitude")
-            comp_lng = comp.get("Lon") or comp.get("longitude")
-        else:
-            comp_lat = comp.get("latitude")
-            comp_lng = comp.get("longitude")
+        normalize_comparable(comp)
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # FASE 2 — SCORE LIGHT: solo campos disponibles en scrape de las 3 fuentes
+    #          → top 30 candidatos para enrichment
+    # ═══════════════════════════════════════════════════════════════════
+    target_proptype_norm    = normalize_propertytype(request.property_type)
+    target_state_canonical  = normalize_state_canonical(request.state)  # "good"/"renew"/"newdevelopment"
+    target_is_newdev        = (target_state_canonical == "newdevelopment")
+    
+    for comp in all_comparables:
+        n = comp["_norm"]
         
-        if comp_lat and comp_lng:
-            comp["_distance"] = calc_distance(lat, lng, float(comp_lat), float(comp_lng))
+        # Distancia (usando _norm.lat/lng que ya prioriza detail si existe)
+        if n.get("lat") and n.get("lng"):
+            comp["_distance"] = calc_distance(lat, lng, float(n["lat"]), float(n["lng"]))
         else:
             comp["_distance"] = 99999
         
+        # Score LIGHT
         score = 0
         level_weight = {1: 1000, 2: 500, 3: 100}
         score += level_weight.get(comp.get("_call_level", 3), 0)
         score += max(0, 200 - comp["_distance"] / 15)
-        if comp.get("size"):
-            score += max(0, 150 - abs(comp["size"] - request.total_area) * 5)
-        if comp.get("rooms"):
-            score += max(0, 100 - abs(comp["rooms"] - request.rooms) * 30)
-        if comp.get("bathrooms"):
-            score += max(0, 50 - abs(comp["bathrooms"] - request.bathrooms) * 20)
-        if comp.get("numPhotos", 0) > 0:
-            score += min(30, comp["numPhotos"] * 2)
-        if comp.get("hasPlan"):
+        if n.get("size"):
+            score += max(0, 150 - abs(n["size"] - request.total_area) * 5)
+        if n.get("rooms"):
+            score += max(0, 100 - abs(n["rooms"] - request.rooms) * 30)
+        if n.get("bathrooms"):
+            score += max(0, 50 - abs(n["bathrooms"] - request.bathrooms) * 20)
+        # Propertytype match
+        if n.get("propertytype") and target_proptype_norm and n["propertytype"] == target_proptype_norm:
+            score += 50
+        # newdev match (alineado con state target)
+        if n.get("newdev") is not None and bool(n["newdev"]) == target_is_newdev:
+            score += 30
+        
+        comp["_score_light"] = score
+    
+    all_comparables.sort(key=lambda x: x.get("_score_light", 0), reverse=True)
+    top30 = all_comparables[:30]
+    src_counts_top30 = {"idealista": 0, "fotocasa": 0, "habitaclia": 0}
+    for c in top30:
+        src_counts_top30[c.get("_source", "idealista")] += 1
+    print(f"🎯 Score light → top 30: {src_counts_top30}")
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # FASE 3 — ENRICHMENT HAB del top 30 (paralelo)
+    #          Idealista y Fotocasa ya tienen fotos en scrape, no se enriquecen
+    # ═══════════════════════════════════════════════════════════════════
+    def _fix_hab_url(u):
+        # Habitaclia images llegan como "//images.habimg.com/..."; añadir https:
+        if not u:
+            return None
+        return ("https:" + u) if u.startswith("//") else u
+    
+    habitaclia_indices = [i for i, c in enumerate(top30) if c.get("_source") == "habitaclia"]
+    if habitaclia_indices:
+        print(f"🔍 Enriqueciendo {len(habitaclia_indices)} propiedades de Habitaclia (top 30)...")
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            async def fetch_habitaclia_detail(idx):
+                c = top30[idx]
+                cod_emp = c.get("CodEmp", "")
+                cod_inm = c.get("CodInm", "")
+                if not cod_emp or not cod_inm:
+                    return idx, None
+                try:
+                    resp = await client.post(
+                        f"{RENDER_URL}/habitaclia/detail",
+                        json={"codEmp": cod_emp, "codInm": cod_inm},
+                        timeout=10.0
+                    )
+                    if resp.status_code == 200:
+                        return idx, resp.json()
+                except Exception as e:
+                    print(f"⚠️ Error detail HAB {cod_emp}-{cod_inm}: {e}")
+                return idx, None
+            
+            tasks = [fetch_habitaclia_detail(i) for i in habitaclia_indices]
+            results = await asyncio.gather(*tasks)
+            
+            for idx, detail in results:
+                if not detail:
+                    continue
+                comp = top30[idx]
+                # Mergear campos del detail al comp para que normalize_comparable los lea
+                comp["Images"]              = detail.get("Images", [])
+                comp["ImageCount"]          = detail.get("ImageCount", 0)
+                comp["DescriptionFeatures"] = detail.get("DescriptionFeatures", [])
+                comp["Map"]                 = detail.get("Map") or {}
+                comp["Description"]         = detail.get("Description", "")
+                comp["Agency"]              = detail.get("Agency") or {}
+                comp["Title"]               = detail.get("Title", "")
+                comp["MainImage"]           = detail.get("MainImage", "")
+                comp["DetailSegmentData"]   = detail.get("DetailSegmentData", "")
+                
+                # Extraer imágenes (URLXL > URLG > URL > URLNONE) con fix de scheme
+                extracted_images = []
+                for img in comp.get("Images") or []:
+                    if isinstance(img, dict):
+                        u = _fix_hab_url(img.get("URLXL") or img.get("URLG") or img.get("URL") or img.get("URLNONE"))
+                        if u:
+                            extracted_images.append(u)
+                comp["_images"]    = extracted_images
+                comp["_thumbnail"] = extracted_images[0] if extracted_images else _fix_hab_url(comp.get("MainImage"))
+                
+                # Re-normalizar para que _norm refleje los datos enriquecidos
+                # (numphotos, exterior, haslift, lat/lng más precisos)
+                normalize_comparable(comp)
+                
+                # Recalcular distance con coordenadas más precisas (Map.VGPSLat/Lon)
+                n = comp["_norm"]
+                if n.get("lat") and n.get("lng"):
+                    comp["_distance"] = calc_distance(lat, lng, float(n["lat"]), float(n["lng"]))
+                
+                print(f"✅ HAB {comp.get('CodEmp')}-{comp.get('CodInm')}: {len(extracted_images)} fotos")
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # FASE 4 — SCORE FULL: añadir bonuses sobre score_light usando datos
+    #          enriquecidos. Los campos ausentes en una source NO penalizan
+    #          (no suman, pero tampoco restan): refleja la realidad de que
+    #          hay menos información para juzgar similitud con la propiedad.
+    # ═══════════════════════════════════════════════════════════════════
+    target_haslift     = bool(request.extras.elevator)
+    target_exterior    = bool(request.extras.exterior)
+    target_floor_tier  = floor_tier(request.floor)  # None si no se proporciona
+    target_status_idl  = map_state(request.state)   # "good"/"renew"/"newdevelopment" (formato Idealista)
+    
+    for comp in top30:
+        n = comp["_norm"]
+        score = comp.get("_score_light", 0)
+        
+        # 1) status match (campo Idealista-nativo, ausente en FC/HAB scrape)
+        if n.get("status") is not None and n.get("status") == target_status_idl:
+            score += 30
+        
+        # 2) exterior match (Idealista nativo + FC dynamicFeatures + HAB enrich DescriptionFeatures)
+        if n.get("exterior") is not None and bool(n["exterior"]) == target_exterior:
+            score += 25
+        
+        # 3) haslift match (Idealista nativo + FC extraList + HAB enrich DescriptionFeatures)
+        if n.get("haslift") is not None and bool(n["haslift"]) == target_haslift:
+            score += 25
+        
+        # 4) numphotos threshold (no premiar excesivamente, sí penalizar muy pocas)
+        np = n.get("numphotos") or 0
+        if np == 0:
+            score += -10
+        elif np <= 2:
+            score += -5
+        elif np <= 4:
+            score += 0
+        else:  # >= 5
+            score += 10
+        
+        # 5) hasplan bonus (Idealista hasPlan + FC hasDescriptionPlan; HAB no tiene)
+        if n.get("hasplan"):
+            score += 5
+        
+        # 6) floor_tier match (solo si target_floor_tier se pudo derivar Y comp tiene floor_tier)
+        if target_floor_tier and n.get("floor_tier") and n["floor_tier"] == target_floor_tier:
             score += 20
+        
         comp["_score"] = score
     
-    all_comparables.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    top_comparables = all_comparables[:15]
-    
-    # Enriquecer Habitaclia con detail API (imágenes)
-    habitaclia_indices = [i for i, c in enumerate(top_comparables) if c.get("_source") == "habitaclia"]
-    if habitaclia_indices:
-        print(f"🔍 Enriqueciendo {len(habitaclia_indices)} propiedades de Habitaclia...")
-        
-        async def fetch_habitaclia_detail(idx):
-            c = top_comparables[idx]
-            cod_emp = c.get("CodEmp", "")
-            cod_inm = c.get("CodInm", "")
-            if not cod_emp or not cod_inm:
-                return idx, None
-            try:
-                resp = await client.post(
-                    f"{RENDER_URL}/habitaclia/detail",
-                    json={"codEmp": cod_emp, "codInm": cod_inm},
-                    timeout=10.0
-                )
-                if resp.status_code == 200:
-                    return idx, resp.json()
-            except Exception as e:
-                print(f"⚠️ Error detail Habitaclia {cod_emp}-{cod_inm}: {e}")
-            return idx, None
-        
-        # Llamadas en paralelo
-        tasks = [fetch_habitaclia_detail(i) for i in habitaclia_indices]
-        results = await asyncio.gather(*tasks)
-        
-        for idx, detail in results:
-            if detail:
-                # Extraer imágenes del detail
-                fotos = detail.get("fotos", [])
-                images = [f.get("url") or f.get("Url") for f in fotos if f.get("url") or f.get("Url")]
-                top_comparables[idx]["_images"] = images
-                top_comparables[idx]["_thumbnail"] = images[0] if images else ""
-                print(f"✅ Habitaclia {top_comparables[idx].get('CodEmp')}-{top_comparables[idx].get('CodInm')}: {len(images)} fotos")
+    top30.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    top_comparables = top30[:15]
+    src_counts_final = {"idealista": 0, "fotocasa": 0, "habitaclia": 0}
+    for c in top_comparables:
+        src_counts_final[c.get("_source", "idealista")] += 1
+    print(f"🏆 Score full → top 15 final: {src_counts_final}")
     
     # Calcular valoración
     prices = [c["price"] for c in top_comparables if c.get("price") and c["price"] > 0]
@@ -627,7 +909,8 @@ async def search_comparables(request: SearchComparablesRequest):
         # Normalizar campos según fuente
         if source == "habitaclia":
             # Habitaclia usa: PvpInm, M2Inm, NumHab, NumBany, NomZona
-            # NOTA: Las coordenadas solo vienen en enrichment (detail API), no en scrape
+            # Coordenadas vienen en Point.Lat/Lon (scrape) y se refinan en Map.VGPSLat/Lon
+            # (post-enrichment); el código usa `_norm.lat/lng` que ya hace prioridad correcta.
             price = c.get("PvpInm") or c.get("basic_info", {}).get("price", 0)
             size = c.get("M2Inm") or c.get("basic_info", {}).get("surface", 0)
             rooms = c.get("NumHab") or c.get("basic_info", {}).get("rooms", 0)
@@ -641,9 +924,10 @@ async def search_comparables(request: SearchComparablesRequest):
             url = f"https://www.habitaclia.com/vivienda-{prop_id}.htm"
             thumbnail = c.get("_thumbnail", "")
             images = c.get("_images", [])
-            # Coordenadas ya normalizadas desde Point.Lat/Point.Lon
-            lat = c.get("latitude")
-            lng = c.get("longitude")
+            # Coordenadas: usar _norm que prioriza VGPSLat/Lon (detail) > Point.Lat/Lon (scrape)
+            n_hab = c.get("_norm") or {}
+            lat = n_hab.get("lat") or c.get("latitude")
+            lng = n_hab.get("lng") or c.get("longitude")
         elif source == "fotocasa":
             # Fotocasa: placeholders[].property con pageSize=36 incluye todos los datos
             price = c.get("price", 0)
@@ -655,10 +939,21 @@ async def search_comparables(request: SearchComparablesRequest):
             title = f"{rooms} hab, {size}m² - {address}" if rooms and size else subtype.capitalize()
             prop_id = c.get("propertyId") or c.get("id", "").replace("1_", "")
             url = c.get("urlMarketplace") or f"https://www.fotocasa.es/es/comprar/vivienda/{prop_id}"
-            # Imágenes desde mediaList
+            # Imágenes desde mediaList. Tech debt: extraer LARGE (~800px) de mediaUrlDtos
+            # en lugar de la URL top-level que es LARGE_LEGACY (~1200px), para tener
+            # tamaño consistente con Idealista en la galería del frontend.
             media_list = c.get("mediaList", [])
-            thumbnail = media_list[0].get("url", "") if media_list else ""
-            images = [m.get("url") for m in media_list if m.get("url")]
+            def _fc_pick_large(media_item):
+                # Preferir LARGE de mediaUrlDtos; fallback a url top-level si no hay
+                if not isinstance(media_item, dict):
+                    return None
+                dtos = media_item.get("mediaUrlDtos") or []
+                for dto in dtos:
+                    if isinstance(dto, dict) and dto.get("mediaSize") == "LARGE" and dto.get("url"):
+                        return dto["url"]
+                return media_item.get("url")
+            images = [u for u in (_fc_pick_large(m) for m in media_list) if u]
+            thumbnail = images[0] if images else ""
             lat = c.get("latitude")
             lng = c.get("longitude")
         else:
@@ -672,10 +967,16 @@ async def search_comparables(request: SearchComparablesRequest):
             prop_id = c.get("propertyCode") or c.get("id")
             url = c.get("url", "")
             thumbnail = c.get("thumbnail", "")
-            multimedia = c.get("multimedia", {})
-            if isinstance(multimedia, dict):
-                images_list = multimedia.get("images", [])
-                images = [img.get("url") for img in images_list if isinstance(img, dict) and img.get("url")]
+            multimedia = c.get("multimedia", [])
+            if isinstance(multimedia, list) and len(multimedia) > 0:
+                if isinstance(multimedia[0], str):
+                    images = multimedia
+                elif isinstance(multimedia[0], dict):
+                    images = [img.get("url") for img in multimedia if img.get("url")]
+                else:
+                    images = []
+            elif isinstance(multimedia, dict):
+                images = [v for v in multimedia.values() if isinstance(v, str) and v.startswith("http")]
             else:
                 images = []
             lat = c.get("latitude")
