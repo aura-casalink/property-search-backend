@@ -673,10 +673,17 @@ async def search_comparables(request: SearchComparablesRequest):
             url = c.get("url", "")
             thumbnail = c.get("thumbnail", "")
             multimedia = c.get("multimedia", [])
-            if multimedia and isinstance(multimedia[0], str):
-                images = multimedia  # Ya son URLs directas
+            if isinstance(multimedia, list) and len(multimedia) > 0:
+                if isinstance(multimedia[0], str):
+                    images = multimedia
+                elif isinstance(multimedia[0], dict):
+                    images = [img.get("url") for img in multimedia if img.get("url")]
+                else:
+                    images = []
+            elif isinstance(multimedia, dict):
+                images = [v for v in multimedia.values() if isinstance(v, str) and v.startswith("http")]
             else:
-                images = [img.get("url") for img in multimedia if isinstance(img, dict) and img.get("url")]
+                images = []
             lat = c.get("latitude")
             lng = c.get("longitude")
         
