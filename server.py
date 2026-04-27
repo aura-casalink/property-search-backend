@@ -272,6 +272,200 @@ class IdealistaService:
         except:
             return floor
 
+    def search_by_cadastre(self, cadastre_ref: str) -> Dict:
+        """
+        Busca por referencia catastral (parcela ~14 chars o unidad ~20 chars).
+
+        Devuelve uno de estos formatos:
+        - type=unit:       vivienda concreta resuelta (formato similar a get_property)
+        - type=building:   edificio resuelto (formato similar a get_building)
+        - type=candidates: varios candidatos, el frontend debe elegir
+        - {success: false, error}: no encontrada o error
+        """
+        try:
+            ref = (cadastre_ref or "").strip().upper()
+            if not ref:
+                return {"success": False, "error": "Referencia catastral vacía"}
+
+            # 1) Reverse lookup: ref → slugs
+            response = httpx.get(
+                f"{self.hetzner_url}/api/idealista/cadastre/{ref}",
+                timeout=30,
+            )
+            data = response.json()
+            if not data.get("success"):
+                return data
+
+            results = data.get("data", []) or []
+            if not results:
+                return {"success": False, "error": "Referencia catastral no encontrada"}
+
+            # 2) ¿Hay match exacto con `reference` llena? → ref de unidad
+            exact_match = next(
+                (r for r in results
+                 if (r.get("reference") or "").strip().upper() == ref),
+                None,
+            )
+
+            if exact_match:
+                street = exact_match.get("street", {}) or {}
+                town = street.get("town", {}) or {}
+                city_slug = town.get("slug")
+                street_slug = street.get("slug")
+                number = street.get("number")
+                if not (city_slug and street_slug and number):
+                    return {"success": False, "error": "Datos de calle incompletos en respuesta del servidor"}
+                return self._fetch_unit_or_building(city_slug, street_slug, number, ref)
+
+            # 3) Sin match exacto: filtrar resultados con slugs válidos
+            valid = [
+                r for r in results
+                if ((r.get("street") or {}).get("slug")
+                    and (r.get("street") or {}).get("number")
+                    and ((r.get("street") or {}).get("town") or {}).get("slug"))
+            ]
+            if not valid:
+                return {"success": False, "error": "Referencia catastral no encontrada"}
+
+            if len(valid) == 1:
+                # Una sola parcela: devolver el building (y por si acaso buscamos la ref dentro)
+                street = valid[0].get("street", {}) or {}
+                town = street.get("town", {}) or {}
+                return self._fetch_unit_or_building(
+                    town.get("slug"),
+                    street.get("slug"),
+                    street.get("number"),
+                    ref,
+                )
+
+            # Varios candidatos: el frontend debe elegir
+            candidates = []
+            for r in valid:
+                street = r.get("street", {}) or {}
+                town = street.get("town", {}) or {}
+                candidates.append({
+                    "display": r.get("name") or f"{street.get('type', '')} {street.get('name', '')}, {street.get('number', '')}".strip(),
+                    "city_slug": town.get("slug"),
+                    "street_slug": street.get("slug"),
+                    "number": street.get("number"),
+                    "city_name": town.get("name"),
+                })
+            return {
+                "success": True,
+                "type": "candidates",
+                "candidates": candidates,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _fetch_unit_or_building(self, city_slug: str, street_slug: str, number: str, target_ref: str) -> Dict:
+        """
+        Llama a /api/idealista/location/ y decide:
+        - Si target_ref aparece en properties[] → devuelve type=unit completa
+        - Si no → devuelve type=building con la lista de units
+        """
+        try:
+            response = httpx.get(
+                f"{self.hetzner_url}/api/idealista/location/{city_slug}/{street_slug}/{number}",
+                timeout=30,
+            )
+            data = response.json()
+            if not data.get("success"):
+                return data
+
+            location_data = data.get("data", {}) or {}
+            parcels = location_data.get("parcels", []) or location_data.get("cadastre", {}).get("items", [])
+            if not parcels:
+                return {"success": False, "error": "No se encontraron datos del edificio"}
+
+            parcel = parcels[0]
+            attrs = parcel.get("attributes", {}) or {}
+
+            centroid = parcel.get("centroid", {}) or {}
+            coordinates = None
+            if centroid.get("latitude") and centroid.get("longitude"):
+                coordinates = {"lat": centroid.get("latitude"), "lng": centroid.get("longitude")}
+
+            building_info = {
+                "year": attrs.get("constructed_year"),
+                "total_floors": attrs.get("total_floors"),
+                "has_lift": attrs.get("has_lift"),
+                "has_parking": attrs.get("has_parking"),
+                "has_pool": attrs.get("has_swimming_pool"),
+                "has_garden": attrs.get("has_garden"),
+                "has_doorman": attrs.get("has_doorman"),
+                "has_storage": attrs.get("has_storage"),
+            }
+
+            target = (target_ref or "").strip().upper()
+            properties = parcel.get("properties", []) or []
+
+            matched = next(
+                (p for p in properties
+                 if (p.get("reference") or "").strip().upper() == target),
+                None,
+            )
+
+            if matched:
+                # type = unit
+                structures = matched.get("structures", []) or []
+                living_area = sum((s.get("area") or 0) for s in structures if s.get("typology") == "V")
+                common_area = sum((s.get("area") or 0) for s in structures if s.get("typology") == "COMMON")
+                return {
+                    "success": True,
+                    "type": "unit",
+                    "cadastre_ref": matched.get("reference"),
+                    "name": matched.get("name"),
+                    "address": location_data.get("address"),
+                    "postal_code": location_data.get("postal_code"),
+                    "coordinates": coordinates,
+                    "rooms": matched.get("room_number"),
+                    "bathrooms": matched.get("bathroom_number"),
+                    "total_area": matched.get("area"),
+                    "living_area": living_area,
+                    "common_area": common_area,
+                    "floor": structures[0].get("floor") if structures else None,
+                    "door": structures[0].get("door") if structures else None,
+                    "energy_certificate": matched.get("energy_certificate"),
+                    "is_residential": matched.get("is_residential"),
+                    "typology": matched.get("typology"),
+                    "building": building_info,
+                    "city_slug": city_slug,
+                    "street_slug": street_slug,
+                    "number": number,
+                }
+
+            # type = building
+            units = []
+            for prop in properties:
+                if not prop.get("is_residential"):
+                    continue
+                structures = prop.get("structures", []) or []
+                units.append({
+                    "cadastre_ref": prop.get("reference"),
+                    "name": prop.get("name"),
+                    "floor": structures[0].get("floor") if structures else None,
+                    "door": structures[0].get("door") if structures else None,
+                    "area": prop.get("area"),
+                })
+            units.sort(key=lambda x: (x.get("floor") or "", x.get("door") or ""))
+
+            return {
+                "success": True,
+                "type": "building",
+                "address": location_data.get("address"),
+                "postal_code": location_data.get("postal_code"),
+                "coordinates": coordinates,
+                "building": building_info,
+                "units": units,
+                "city_slug": city_slug,
+                "street_slug": street_slug,
+                "number": number,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
 idealista_service = IdealistaService()
 
@@ -290,6 +484,10 @@ async def get_building(request: GetBuildingRequest):
 @app.post("/api/get-property")
 async def get_property(request: GetPropertyRequest):
     return idealista_service.get_property(request.city_slug, request.street_slug, request.number, request.floor, request.door)
+
+@app.post("/api/search-by-cadastre")
+async def search_by_cadastre(request: CadastreRequest):
+    return idealista_service.search_by_cadastre(request.cadastre_ref)
 
 @app.post("/api/search-comparables")
 async def search_comparables(request: SearchComparablesRequest):
