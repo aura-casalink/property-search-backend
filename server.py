@@ -672,7 +672,11 @@ async def search_comparables(request: SearchComparablesRequest):
             prop_id = c.get("propertyCode") or c.get("id")
             url = c.get("url", "")
             thumbnail = c.get("thumbnail", "")
-            images = [img.get("url") for img in c.get("multimedia", []) if img.get("url")]
+            multimedia = c.get("multimedia", [])
+            if multimedia and isinstance(multimedia[0], str):
+                images = multimedia  # Ya son URLs directas
+            else:
+                images = [img.get("url") for img in multimedia if isinstance(img, dict) and img.get("url")]
             lat = c.get("latitude")
             lng = c.get("longitude")
         
