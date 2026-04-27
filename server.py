@@ -13,6 +13,7 @@ from fastapi.responses import Response
 from dossier import generate_dossier_pdf, generate_dossier_filename
 from pydantic import BaseModel
 from typing import Dict, Optional
+import asyncio
 
 COOKIE_SERVER_URL = os.getenv("COOKIE_SERVER_URL", "http://37.27.8.255:5001")
 
@@ -564,6 +565,42 @@ async def search_comparables(request: SearchComparablesRequest):
     all_comparables.sort(key=lambda x: x.get("_score", 0), reverse=True)
     top_comparables = all_comparables[:15]
     
+    # Enriquecer Habitaclia con detail API (imágenes)
+    habitaclia_indices = [i for i, c in enumerate(top_comparables) if c.get("_source") == "habitaclia"]
+    if habitaclia_indices:
+        print(f"🔍 Enriqueciendo {len(habitaclia_indices)} propiedades de Habitaclia...")
+        
+        async def fetch_habitaclia_detail(idx):
+            c = top_comparables[idx]
+            cod_emp = c.get("CodEmp", "")
+            cod_inm = c.get("CodInm", "")
+            if not cod_emp or not cod_inm:
+                return idx, None
+            try:
+                resp = await client.post(
+                    f"{RENDER_URL}/habitaclia/detail",
+                    json={"codEmp": cod_emp, "codInm": cod_inm},
+                    timeout=10.0
+                )
+                if resp.status_code == 200:
+                    return idx, resp.json()
+            except Exception as e:
+                print(f"⚠️ Error detail Habitaclia {cod_emp}-{cod_inm}: {e}")
+            return idx, None
+        
+        # Llamadas en paralelo
+        tasks = [fetch_habitaclia_detail(i) for i in habitaclia_indices]
+        results = await asyncio.gather(*tasks)
+        
+        for idx, detail in results:
+            if detail:
+                # Extraer imágenes del detail
+                fotos = detail.get("fotos", [])
+                images = [f.get("url") or f.get("Url") for f in fotos if f.get("url") or f.get("Url")]
+                top_comparables[idx]["_images"] = images
+                top_comparables[idx]["_thumbnail"] = images[0] if images else ""
+                print(f"✅ Habitaclia {top_comparables[idx].get('CodEmp')}-{top_comparables[idx].get('CodInm')}: {len(images)} fotos")
+    
     # Calcular valoración
     prices = [c["price"] for c in top_comparables if c.get("price") and c["price"] > 0]
     if prices:
@@ -602,8 +639,8 @@ async def search_comparables(request: SearchComparablesRequest):
             title = f"{rooms} hab, {size}m² - {address}" if rooms and size else address
             prop_id = f"{c.get('CodEmp', '')}-{c.get('CodInm', '')}"
             url = f"https://www.habitaclia.com/vivienda-{prop_id}.htm"
-            thumbnail = ""
-            images = []  # Habitaclia no incluye imágenes en scrape de clusters
+            thumbnail = c.get("_thumbnail", "")
+            images = c.get("_images", [])
             # Coordenadas ya normalizadas desde Point.Lat/Point.Lon
             lat = c.get("latitude")
             lng = c.get("longitude")
