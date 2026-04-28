@@ -152,7 +152,7 @@ class IdealistaService:
             if not data.get("success"):
                 return data
             location_data = data.get("data", {})
-            parcels = location_data.get("parcels", []) or location_data.get("cadastre", {}).get("items", [])
+            parcels = location_data.get("parcels", []) or (location_data.get("cadastre") or {}).get("items", [])
             if not parcels:
                 return {"success": False, "error": "No building data found"}
             parcel = parcels[0]
@@ -206,7 +206,7 @@ class IdealistaService:
             if not data.get("success"):
                 return data
             location_data = data.get("data", {})
-            parcels = location_data.get("parcels", []) or location_data.get("cadastre", {}).get("items", [])
+            parcels = location_data.get("parcels", []) or (location_data.get("cadastre") or {}).get("items", [])
             if not parcels:
                 return {"success": False, "error": "No building data found"}
             parcel = parcels[0]
@@ -375,7 +375,7 @@ class IdealistaService:
                 return data
 
             location_data = data.get("data", {}) or {}
-            parcels = location_data.get("parcels", []) or location_data.get("cadastre", {}).get("items", [])
+            parcels = location_data.get("parcels", []) or (location_data.get("cadastre") or {}).get("items", [])
             if not parcels:
                 return {"success": False, "error": "No se encontraron datos del edificio"}
 
