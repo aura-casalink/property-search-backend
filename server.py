@@ -156,7 +156,7 @@ class IdealistaService:
             if not parcels:
                 return {"success": False, "error": "No building data found"}
             parcel = parcels[0]
-            attrs = parcel.get("attributes", {})
+            attrs = parcel.get("attributes", {}) or {}
             units = []
             for prop in parcel.get("properties", []):
                 if not prop.get("is_residential"):
@@ -210,7 +210,7 @@ class IdealistaService:
             if not parcels:
                 return {"success": False, "error": "No building data found"}
             parcel = parcels[0]
-            attrs = parcel.get("attributes", {})
+            attrs = parcel.get("attributes", {}) or {}
             # Extraer coordenadas
             centroid = parcel.get("centroid", {})
             coordinates = None
